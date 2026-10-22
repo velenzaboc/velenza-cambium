@@ -44,6 +44,7 @@ CREATE TABLE SymbolEdges (
 CREATE TABLE Snapshots (
   repo STRING(128) NOT NULL,
   snapshot_id STRING(64) NOT NULL,
+  storage_snapshot_id STRING(64),
   label STRING(256) NOT NULL,
   commit_sha STRING(40) NOT NULL,
   commit_time TIMESTAMP,

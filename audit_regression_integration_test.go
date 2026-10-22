@@ -5,6 +5,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -172,7 +174,11 @@ func newAuditEmulatorInterceptedDB(t *testing.T, interceptor grpc.UnaryClientInt
 	}
 	t.Cleanup(func() { _ = instanceAdmin.Close() })
 
-	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	var suffixBytes [12]byte
+	if _, err := rand.Read(suffixBytes[:]); err != nil {
+		t.Fatalf("generate emulator database suffix: %v", err)
+	}
+	suffix := hex.EncodeToString(suffixBytes[:])
 	projectID := "cambium-audit"
 	instanceID := "audit-" + suffix
 	databaseID := "audit-" + suffix
@@ -280,6 +286,110 @@ func auditVisibleSnapshotMemberCount(t *testing.T, client *spanner.Client, repo,
 	return int64(len(members))
 }
 
+func auditPhysicalSnapshotID(t *testing.T, client *spanner.Client, repo, snapshot string) string {
+	t.Helper()
+	iter := client.Single().Query(context.Background(), spanner.Statement{
+		SQL: `SELECT COALESCE(storage_snapshot_id, snapshot_id)
+		      FROM Snapshots
+		      WHERE repo=@repo AND snapshot_id=@snapshot`,
+		Params: map[string]any{"repo": repo, "snapshot": snapshot},
+	})
+	defer iter.Stop()
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatalf("resolve physical snapshot for %s@%s: %v", repo, snapshot, err)
+	}
+	var physical string
+	if err := row.Columns(&physical); err != nil {
+		t.Fatalf("decode physical snapshot for %s@%s: %v", repo, snapshot, err)
+	}
+	if _, err := iter.Next(); err == nil {
+		t.Fatalf("logical snapshot %s@%s resolved to multiple rows", repo, snapshot)
+	}
+	return physical
+}
+
+type auditGeneration struct {
+	snapshotID string
+	memberID   string
+	memberFQN  string
+	targetID   string
+	fileBody   string
+	chunkBody  string
+}
+
+func auditSeedGeneration(t *testing.T, client *spanner.Client, repo string, generation auditGeneration, kind string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := writeSnapshot(ctx, client, repo, generation.snapshotID, generation.snapshotID,
+		strings.Repeat("a", 40), time.Now().UTC(), "main", nil, ingestOpts{kind: kind}, 2); err != nil {
+		t.Fatalf("seed %s generation row: %v", kind, err)
+	}
+	auditInsertMember(t, client, repo, generation.snapshotID, generation.memberID, generation.memberFQN, nil)
+	auditInsertMember(t, client, repo, generation.snapshotID, generation.targetID, generation.memberFQN+"Target", nil)
+	if err := writeSnapshotSymbolEdges(ctx, client, repo, generation.snapshotID, []Edge{{
+		Repo:       repo,
+		SnapshotID: generation.snapshotID,
+		SrcID:      generation.memberID,
+		DstID:      generation.targetID,
+		Kind:       "CALLS",
+	}}, auditNoProgress); err != nil {
+		t.Fatalf("seed %s generation edges: %v", kind, err)
+	}
+	fileSHA := sha256Hex(generation.fileBody)
+	chunkSHA := sha256Hex(generation.chunkBody)
+	applyTestMutations(t, client,
+		spanner.Insert("FileContents",
+			[]string{"content_sha", "chunk_index", "bytes", "created_at"},
+			[]any{fileSHA, int64(0), []byte(generation.fileBody), spanner.CommitTimestamp}),
+		spanner.Insert("SnapshotFiles",
+			[]string{"repo", "snapshot_id", "file_path", "content_sha", "is_go", "file_order"},
+			[]any{repo, generation.snapshotID, "generation.go", fileSHA, true, int64(0)}),
+		spanner.Insert("DeclSource",
+			[]string{"content_sha", "source", "created_at"},
+			[]any{chunkSHA, generation.chunkBody, spanner.CommitTimestamp}),
+		spanner.Insert("GoFileChunks",
+			[]string{"repo", "snapshot_id", "file_path", "chunk_index", "chunk_kind", "symbol_fqns", "content_sha", "blank_before"},
+			[]any{repo, generation.snapshotID, "generation.go", int64(0), "decl", []string{generation.memberFQN}, chunkSHA, false}),
+	)
+}
+
+func auditAssertPublishedGeneration(t *testing.T, client *spanner.Client, repo, logicalSnapshot string, generation auditGeneration) {
+	t.Helper()
+	ctx := context.Background()
+	if got := auditPhysicalSnapshotID(t, client, repo, logicalSnapshot); got != generation.snapshotID {
+		t.Fatalf("logical snapshot %s points to %q, want generation %q", logicalSnapshot, got, generation.snapshotID)
+	}
+	members, err := snapshotMemberMeta(ctx, client, repo, logicalSnapshot)
+	if err != nil {
+		t.Fatalf("load public generation members: %v", err)
+	}
+	if len(members) != 2 || members[generation.memberID].FQN != generation.memberFQN || members[generation.targetID].FQN != generation.memberFQN+"Target" {
+		t.Fatalf("public members do not belong exclusively to %s: %+v", generation.snapshotID, members)
+	}
+	edges, err := loadSnapshotEdges(ctx, client, repo, logicalSnapshot)
+	if err != nil {
+		t.Fatalf("load public generation edges: %v", err)
+	}
+	if len(edges) != 1 || edges[0].Src != generation.memberID || edges[0].Dst != generation.targetID || edges[0].Kind != "CALLS" {
+		t.Fatalf("public edges do not belong exclusively to %s: %+v", generation.snapshotID, edges)
+	}
+	files, err := loadSnapshotFiles(ctx, client, repo, logicalSnapshot)
+	if err != nil {
+		t.Fatalf("load public generation files: %v", err)
+	}
+	if got := auditFile(t, files, "generation.go"); !bytes.Equal(got, []byte(generation.fileBody)) {
+		t.Fatalf("public file bytes = %q, want generation %s bytes %q", got, generation.snapshotID, generation.fileBody)
+	}
+	chunks, err := loadGoFileChunks(ctx, client, repo, logicalSnapshot)
+	if err != nil {
+		t.Fatalf("load public generation chunks: %v", err)
+	}
+	if got := chunks["generation.go"]; len(got) != 1 || got[0].text != generation.chunkBody {
+		t.Fatalf("public chunks do not belong exclusively to %s: %+v", generation.snapshotID, got)
+	}
+}
+
 func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *testing.T) {
 	var enabled atomic.Bool
 	var fileCommits atomic.Int32
@@ -356,6 +466,155 @@ func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *tes
 	}
 	if got := auditFile(t, afterRetry, "large.txt"); !bytes.Equal(got, newBytes) {
 		t.Fatalf("retried large file length/content = %d bytes, want complete %d-byte content", len(got), len(newBytes))
+	}
+}
+
+func TestAuditC2RepublicationKeepsLogicalIDAndSwitchesWholeGeneration(t *testing.T) {
+	var rejectPublication atomic.Bool
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if rejectPublication.Load() && auditCommitWritesTable(req, "Snapshots") {
+			return status.Error(codes.PermissionDenied, "audit injected publication refusal")
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+	client := newAuditEmulatorInterceptedDB(t, interceptor)
+	ctx := context.Background()
+	repo := "generation-switch-repo"
+	logicalSnapshot := strings.Repeat("b", 40)
+	legacy := auditGeneration{
+		snapshotID: logicalSnapshot,
+		memberID:   "legacy-member",
+		memberFQN:  "example.test/generation.Legacy",
+		targetID:   "legacy-target",
+		fileBody:   "package generation\n\nfunc Legacy() int { return 0 }\n",
+		chunkBody:  "func Legacy() int { return 0 }",
+	}
+	auditSeedGeneration(t, client, repo, legacy, "ingested")
+	legacyRow, err := client.Single().ReadRow(ctx, "Snapshots", spanner.Key{repo, logicalSnapshot}, []string{"storage_snapshot_id"})
+	if err != nil {
+		t.Fatalf("read legacy public snapshot: %v", err)
+	}
+	var legacyStorage spanner.NullString
+	if err := legacyRow.Columns(&legacyStorage); err != nil || legacyStorage.Valid {
+		t.Fatalf("legacy public snapshot storage pointer = %+v, %v; want NULL", legacyStorage, err)
+	}
+	auditAssertPublishedGeneration(t, client, repo, logicalSnapshot, legacy)
+
+	first := auditGeneration{
+		snapshotID: "private-generation-one",
+		memberID:   "first-member",
+		memberFQN:  "example.test/generation.First",
+		targetID:   "first-target",
+		fileBody:   "package generation\n\nfunc First() int { return 1 }\n",
+		chunkBody:  "func First() int { return 1 }",
+	}
+	auditSeedGeneration(t, client, repo, first, "staging")
+	if err := publishStagedSnapshot(ctx, client, repo, first.snapshotID, logicalSnapshot, "ingested"); err != nil {
+		t.Fatalf("publish first generation: %v", err)
+	}
+	auditAssertPublishedGeneration(t, client, repo, logicalSnapshot, first)
+	if visible, err := snapshotExists(ctx, client, repo, first.snapshotID); err != nil || visible {
+		t.Fatalf("first private generation became independently visible: visible=%v err=%v", visible, err)
+	}
+
+	second := auditGeneration{
+		snapshotID: "private-generation-two",
+		memberID:   "second-member",
+		memberFQN:  "example.test/generation.Second",
+		targetID:   "second-target",
+		fileBody:   "package generation\n\nfunc Second() int { return 2 }\n",
+		chunkBody:  "func Second() int { return 2 }",
+	}
+	auditSeedGeneration(t, client, repo, second, "staging")
+	rejectPublication.Store(true)
+	if err := publishStagedSnapshot(ctx, client, repo, second.snapshotID, logicalSnapshot, "ingested"); err == nil {
+		t.Fatal("second generation published despite injected publication refusal")
+	}
+	rejectPublication.Store(false)
+	auditAssertPublishedGeneration(t, client, repo, logicalSnapshot, first)
+
+	if err := publishStagedSnapshot(ctx, client, repo, second.snapshotID, logicalSnapshot, "ingested"); err != nil {
+		t.Fatalf("publish second generation: %v", err)
+	}
+	auditAssertPublishedGeneration(t, client, repo, logicalSnapshot, second)
+	if visible, err := snapshotExists(ctx, client, repo, second.snapshotID); err != nil || visible {
+		t.Fatalf("second private generation became independently visible: visible=%v err=%v", visible, err)
+	}
+	commits, err := doListCommits(ctx, client)
+	if err != nil || len(commits) != 1 || commits[0].SnapshotID != logicalSnapshot {
+		t.Fatalf("public commit identity changed across generations: commits=%+v err=%v", commits, err)
+	}
+}
+
+func TestAuditC2LostPublicationAcknowledgementPreservesPublishedGeneration(t *testing.T) {
+	var faultEnabled atomic.Bool
+	var snapshotCommits atomic.Int32
+	var publicationCommitted atomic.Bool
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if !faultEnabled.Load() || !auditCommitWritesTable(req, "Snapshots") {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+		if snapshotCommits.Add(1) == 1 {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+		if publicationCommitted.CompareAndSwap(false, true) {
+			if err := invoker(ctx, method, req, reply, cc, opts...); err != nil {
+				publicationCommitted.Store(false)
+				return err
+			}
+		}
+		return status.Error(codes.Unavailable, "audit dropped committed publication response")
+	}
+	client := newAuditEmulatorInterceptedDB(t, interceptor)
+	auditInstallEmbeddings(t)
+	ctx := context.Background()
+	repoPath := newTrackedTestRepo(t, map[string]string{
+		"go.mod":  "module example.test/lostack\n\ngo 1.27\n",
+		"main.go": "package lostack\n\nfunc Value() int { return 1 }\n",
+	})
+	initial, err := doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress)
+	if err != nil {
+		t.Fatalf("initial ingest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package lostack\n\nfunc Value() int { return 2 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	faultEnabled.Store(true)
+	_, err = doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress)
+	faultEnabled.Store(false)
+	if err == nil {
+		t.Fatal("fixture did not surface the lost publication acknowledgement")
+	}
+	if !publicationCommitted.Load() {
+		t.Fatal("fixture did not commit publication before dropping its response")
+	}
+	physical := auditPhysicalSnapshotID(t, client, initial.Repo, initial.SnapshotID)
+	if physical == initial.SnapshotID {
+		t.Fatalf("published snapshot still owns mutable children directly: physical=%q", physical)
+	}
+	row, err := client.Single().ReadRow(ctx, "Snapshots", spanner.Key{initial.Repo, physical}, []string{"kind"})
+	if err != nil {
+		t.Fatalf("cleanup removed the committed storage generation row: %v", err)
+	}
+	var kind string
+	if err := row.Columns(&kind); err != nil || kind != "staging" {
+		t.Fatalf("committed storage generation kind=%q err=%v, want private staging", kind, err)
+	}
+	if visible, err := snapshotExists(ctx, client, initial.Repo, physical); err != nil || visible {
+		t.Fatalf("committed storage generation became independently public: visible=%v err=%v", visible, err)
+	}
+	files, err := loadSnapshotFiles(ctx, client, initial.Repo, initial.SnapshotID)
+	if err != nil {
+		t.Fatalf("load generation after lost publication acknowledgement: %v", err)
+	}
+	want := []byte("package lostack\n\nfunc Value() int { return 2 }\n")
+	if got := auditFile(t, files, "main.go"); !bytes.Equal(got, want) {
+		t.Fatalf("cleanup removed the committed generation after lost acknowledgement: got %q want %q", got, want)
+	}
+	chunks, err := loadGoFileChunks(ctx, client, initial.Repo, initial.SnapshotID)
+	if err != nil || len(chunks["main.go"]) == 0 {
+		t.Fatalf("cleanup removed published structural chunks after lost acknowledgement: chunks=%+v err=%v", chunks, err)
 	}
 }
 
@@ -540,8 +799,8 @@ func TestAuditLargeSnapshotPublicationIsBoundedAndAtomicallyVisible(t *testing.T
 	if err != nil {
 		t.Errorf("bounded large snapshot publication failed: %v", err)
 	}
-	if got := maxMutations.Load(); got > mutationLimit {
-		t.Errorf("publication sent %d mutations in one commit, limit is %d", got, mutationLimit)
+	if got := maxMutations.Load(); got != 1 {
+		t.Errorf("publication sent %d mutations, want one bounded pointer mutation", got)
 	}
 	observedMu.Lock()
 	for _, count := range observedCounts {
@@ -551,6 +810,9 @@ func TestAuditLargeSnapshotPublicationIsBoundedAndAtomicallyVisible(t *testing.T
 	}
 	observedMu.Unlock()
 	if err == nil {
+		if got := auditPhysicalSnapshotID(t, client, repo, publicSnapshot); got != stagingSnapshot {
+			t.Errorf("large logical snapshot points to %q, want immutable generation %q", got, stagingSnapshot)
+		}
 		if got := auditVisibleSnapshotMemberCount(t, client, repo, publicSnapshot); got != memberCount {
 			t.Errorf("published member count = %d, want %d", got, memberCount)
 		}
@@ -571,11 +833,12 @@ func TestAuditC4ZeroEdgeReingestClearsStaleVersionEdges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	physicalSnapshot := auditPhysicalSnapshotID(t, client, stats.Repo, stats.SnapshotID)
 	symbolID := uuidFromFQN("example.test/leaf.Leaf")
 	var contentHash string
 	iter := client.Single().Query(ctx, spanner.Statement{
 		SQL:    "SELECT content_hash FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap AND symbol_id=@sid",
-		Params: map[string]any{"repo": stats.Repo, "snap": stats.SnapshotID, "sid": symbolID},
+		Params: map[string]any{"repo": stats.Repo, "snap": physicalSnapshot, "sid": symbolID},
 	})
 	row, err := iter.Next()
 	iter.Stop()
@@ -583,7 +846,7 @@ func TestAuditC4ZeroEdgeReingestClearsStaleVersionEdges(t *testing.T) {
 		t.Fatalf("load leaf version hash: %v", err)
 	}
 	staleID := uuidFromFQN("example.test/leaf.Stale")
-	if err := writeSymbolEdges(ctx, client, []Edge{{Repo: stats.Repo, SnapshotID: stats.SnapshotID, SrcID: symbolID, SrcContentHash: contentHash, DstID: staleID, Kind: "CALLS"}}, auditNoProgress); err != nil {
+	if err := writeSymbolEdges(ctx, client, []Edge{{Repo: stats.Repo, SnapshotID: physicalSnapshot, SrcID: symbolID, SrcContentHash: contentHash, DstID: staleID, Kind: "CALLS"}}, auditNoProgress); err != nil {
 		t.Fatal(err)
 	}
 	before, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
