@@ -314,8 +314,9 @@ func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *tes
 	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		if auditCommitWritesTable(req, "FileContents") {
 			n := fileCommits.Add(1)
-			if enabled.Load() && n == 2 && injected.CompareAndSwap(false, true) {
-				return status.Error(codes.Unavailable, "audit injected second FileContents commit failure")
+			if enabled.Load() && n >= 2 {
+				injected.Store(true)
+				return status.Error(codes.PermissionDenied, "audit injected second FileContents commit failure")
 			}
 		}
 		return invoker(ctx, method, req, reply, cc, opts...)
