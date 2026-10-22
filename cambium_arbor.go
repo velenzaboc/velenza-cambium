@@ -143,7 +143,7 @@ func inarchHead(repoPath string) (string, error) {
 			return headStr, nil
 		}
 	}
-	if lease, err := readSimpleTOML(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
+	if lease, err := readInarchLease(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
 		for _, k := range []string{"head_changeset_id", "base_changeset_id", "changeset_id"} {
 			if v := strings.TrimSpace(lease[k]); v != "" {
 				return v, nil
@@ -188,6 +188,27 @@ func readSimpleTOML(path string) (map[string]string, error) {
 	return out, nil
 }
 
+// Inarch writes the lease as TOML despite its historical .json filename.
+// Older workspaces did write JSON, so retain that format as read compatibility.
+func readInarchLease(path string) (map[string]string, error) {
+	values, err := readSimpleTOML(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(values) != 0 {
+		return values, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var legacy map[string]string
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return nil, err
+	}
+	return legacy, nil
+}
+
 func inarchBranch(repoPath string) string {
 	inarchDir := filepath.Join(repoPath, ".inarch")
 	if headBytes, err := os.ReadFile(filepath.Join(inarchDir, "HEAD")); err == nil {
@@ -201,7 +222,7 @@ func inarchBranch(repoPath string) string {
 			}
 		}
 	}
-	if lease, err := readSimpleTOML(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
+	if lease, err := readInarchLease(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
 		for _, k := range []string{"bookmark", "branch"} {
 			if v := strings.TrimSpace(lease[k]); v != "" {
 				return v
@@ -286,24 +307,21 @@ func validateTrackedFileBoundaries(repoPath string) error {
 	}
 	for _, rel := range paths {
 		full := filepath.Join(repoPath, filepath.FromSlash(rel))
-		info, err := os.Lstat(full)
+		_, err := os.Lstat(full)
 		if err != nil {
 			return fmt.Errorf("tracked file %q: %w", rel, err)
 		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			continue
-		}
 		resolved, err := filepath.EvalSymlinks(full)
 		if err != nil {
-			return fmt.Errorf("tracked symlink %q: %w", rel, err)
+			return fmt.Errorf("tracked file symlink path %q: %w", rel, err)
 		}
 		resolved, err = filepath.Abs(resolved)
 		if err != nil {
-			return fmt.Errorf("tracked symlink %q: %w", rel, err)
+			return fmt.Errorf("tracked file symlink path %q: %w", rel, err)
 		}
 		within, err := filepath.Rel(root, resolved)
 		if err != nil || within == ".." || strings.HasPrefix(within, ".."+string(filepath.Separator)) || filepath.IsAbs(within) {
-			return fmt.Errorf("tracked symlink %q escapes repository checkout", rel)
+			return fmt.Errorf("tracked file symlink path %q escapes repository checkout", rel)
 		}
 	}
 	return nil

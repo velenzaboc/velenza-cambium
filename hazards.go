@@ -717,6 +717,14 @@ func shiftValueBoundedAt(value ssa.Value, block *ssa.BasicBlock, values map[shif
 	case *ssa.ChangeType:
 		return shiftValueBoundedAt(v.X, block, values, blocks)
 	case *ssa.Convert:
+		// An upper bound on a signed source does not survive conversion to an
+		// unsigned shift count: negative values wrap to very large integers.
+		// Require an analysis that proves both bounds before treating such a
+		// conversion as safe; this conservative pass does not yet prove the
+		// lower bound, so keep the hazard visible.
+		if isUnsignedIntegerType(v.Type()) && isSignedIntegerType(v.X.Type()) {
+			return false
+		}
 		return shiftValueBoundedAt(v.X, block, values, blocks)
 	case *ssa.Phi:
 		point := shiftBoundPoint{value: value, block: block}
@@ -735,6 +743,16 @@ func shiftValueBoundedAt(value ssa.Value, block *ssa.BasicBlock, values map[shif
 		return len(v.Edges) > 0
 	}
 	return allPathsConstrainShiftValue(block, value, blocks)
+}
+
+func isUnsignedIntegerType(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+	return ok && basic.Info()&types.IsUnsigned != 0
+}
+
+func isSignedIntegerType(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+	return ok && basic.Info()&types.IsInteger != 0 && basic.Info()&types.IsUnsigned == 0
 }
 
 func allPathsConstrainShiftValue(block *ssa.BasicBlock, value ssa.Value, visiting map[*ssa.BasicBlock]bool) bool {
@@ -1322,13 +1340,17 @@ func doHazards(ctx context.Context, sp *spanner.Client, repo, snap string, opts 
 	if sp == nil {
 		return nil, fmt.Errorf("spanner client is required when repo_path is not provided")
 	}
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snap)
+	if err != nil {
+		return nil, err
+	}
 
 	var syms []Symbol
 	memStmt := spanner.Statement{
 		SQL: `SELECT symbol_id, fqn, content_hash, kind, file_path, line_start, line_end
 		      FROM SnapshotMembers
 		      WHERE repo = @repo AND snapshot_id = @snap`,
-		Params: map[string]interface{}{"repo": repo, "snap": snap},
+		Params: map[string]interface{}{"repo": repo, "snap": ref.StorageID},
 	}
 	iter := sp.Single().Query(ctx, memStmt)
 	for {
@@ -1356,7 +1378,7 @@ func doHazards(ctx context.Context, sp *spanner.Client, repo, snap string, opts 
 	}
 	iter.Stop()
 
-	rows, err := loadSnapshotEdges(ctx, sp, repo, snap)
+	rows, err := loadSnapshotEdgesFromGeneration(ctx, sp, repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}

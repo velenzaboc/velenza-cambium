@@ -39,11 +39,19 @@ func detectAliases(ctx context.Context, sp *spanner.Client, repo, newSnapshotID 
 		return nil
 	}
 
-	priorMembers, err := contentMembers(ctx, sp, repo, prior)
+	priorRef, err := resolveSnapshotRef(ctx, sp, repo, prior)
 	if err != nil {
 		return err
 	}
-	newMembers, err := contentMembers(ctx, sp, repo, newSnapshotID)
+	newRef, err := resolveSnapshotRef(ctx, sp, repo, newSnapshotID)
+	if err != nil {
+		return err
+	}
+	priorMembers, err := contentMembersFromGeneration(ctx, sp, repo, priorRef.StorageID)
+	if err != nil {
+		return err
+	}
+	newMembers, err := contentMembersFromGeneration(ctx, sp, repo, newRef.StorageID)
 	if err != nil {
 		return err
 	}
@@ -85,11 +93,11 @@ func detectAliases(ctx context.Context, sp *spanner.Client, repo, newSnapshotID 
 	}
 
 	// Caller sets: who calls each removed symbol (in prior) / added symbol (in new).
-	removedCallers, err := callerSets(ctx, sp, repo, prior, idsOf(removed))
+	removedCallers, err := callerSetsFromGeneration(ctx, sp, repo, priorRef.StorageID, idsOf(removed))
 	if err != nil {
 		return err
 	}
-	addedCallers, err := callerSets(ctx, sp, repo, newSnapshotID, idsOf(added))
+	addedCallers, err := callerSetsFromGeneration(ctx, sp, repo, newRef.StorageID, idsOf(added))
 	if err != nil {
 		return err
 	}
@@ -176,11 +184,19 @@ func priorSnapshot(ctx context.Context, sp *spanner.Client, repo, snapshotID str
 
 // contentMembers returns the content-bearing symbols of a snapshot.
 func contentMembers(ctx context.Context, sp *spanner.Client, repo, snapshotID string) ([]memberLite, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return contentMembersFromGeneration(ctx, sp, repo, storageID)
+}
+
+func contentMembersFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) ([]memberLite, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT symbol_id, fqn, content_hash
 		      FROM SnapshotMembers
 		      WHERE repo = @repo AND snapshot_id = @snap AND content_hash IS NOT NULL`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -207,6 +223,14 @@ func contentMembers(ctx context.Context, sp *spanner.Client, repo, snapshotID st
 // callerSets returns, per target symbol_id, the set of symbol_ids that call or
 // reference it within the given snapshot.
 func callerSets(ctx context.Context, sp *spanner.Client, repo, snapshotID string, targets []string) (map[string]map[string]struct{}, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return callerSetsFromGeneration(ctx, sp, repo, storageID, targets)
+}
+
+func callerSetsFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string, targets []string) (map[string]map[string]struct{}, error) {
 	out := map[string]map[string]struct{}{}
 	if len(targets) == 0 {
 		return out, nil
@@ -215,7 +239,7 @@ func callerSets(ctx context.Context, sp *spanner.Client, repo, snapshotID string
 	for _, target := range targets {
 		targetSet[target] = struct{}{}
 	}
-	edges, err := loadSnapshotEdges(ctx, sp, repo, snapshotID)
+	edges, err := loadSnapshotEdgesFromGeneration(ctx, sp, repo, storageID)
 	if err != nil {
 		return nil, err
 	}

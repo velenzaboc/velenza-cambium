@@ -308,13 +308,21 @@ type chunkText struct {
 // loadGoFileChunks returns, per .go file_path, the snapshot's ordered chunk
 // texts (GoFileChunks joined to DeclSource).
 func loadGoFileChunks(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (map[string][]chunkText, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return loadGoFileChunksFromGeneration(ctx, sp, repo, storageID)
+}
+
+func loadGoFileChunksFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) (map[string][]chunkText, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT c.file_path, c.chunk_index, c.chunk_kind, c.blank_before, d.source
 		      FROM GoFileChunks AS c
 		      JOIN DeclSource AS d ON d.content_sha = c.content_sha
 		      WHERE c.repo = @repo AND c.snapshot_id = @snap
 		      ORDER BY c.file_path, c.chunk_index`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()

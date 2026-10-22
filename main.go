@@ -382,9 +382,15 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 		return nil, fmt.Errorf("write staging snapshot: %w", err)
 	}
 	stagingLive := true
+	publicationAttempted := false
 	defer func() {
-		if stagingLive {
-			_ = deleteSnapshotData(ctx, sp, repoName, stagingSnapshotID)
+		if stagingLive && !publicationAttempted {
+			// Before publication starts, this generation cannot be visible. Once
+			// a publication commit is attempted, any error may be a lost success
+			// acknowledgement, so preserve the generation for public readers.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = deleteSnapshotGenerationData(cleanupCtx, sp, repoName, stagingSnapshotID)
 		}
 	}()
 	if err := writeSymbolVersions(ctx, sp, stagedSyms, progress); err != nil {
@@ -411,6 +417,7 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 	if err := captureGoChunks(ctx, sp, repoPath, repoName, stagingSnapshotID, progress); err != nil {
 		return nil, fmt.Errorf("capture go chunks: %w", err)
 	}
+	publicationAttempted = true
 	if err := publishStagedSnapshot(ctx, sp, repoName, stagingSnapshotID, snapshotID, publishedKind); err != nil {
 		return nil, fmt.Errorf("publish snapshot: %w", err)
 	}
@@ -446,10 +453,8 @@ func uniqueHashCount(syms []Symbol) int {
 	return len(seen)
 }
 
-// distinctSymbolCount counts unique symbol_ids. It can be below len(syms)
-// because Go permits multiple func init() per package, which collapse to one
-// symbol_id — writeSnapshotMembers upserts them, so the stored row count is
-// the distinct count, and Snapshots.symbol_count must match.
+// distinctSymbolCount counts unique symbol_ids. Snapshot metadata records the
+// stored membership count even if another extractor ever emits a duplicate.
 func distinctSymbolCount(syms []Symbol) int {
 	seen := map[string]struct{}{}
 	for _, s := range syms {
@@ -997,9 +1002,9 @@ func ssaFuncFQN(fn *ssa.Function) string {
 			return recvFQN + "." + fn.Name()
 		}
 	}
-	if fn.Name() == "init" && fn.Prog != nil && fn.Prog.Fset != nil {
+	if (fn.Name() == "init" || strings.HasPrefix(fn.Name(), "init#")) && fn.Prog != nil && fn.Prog.Fset != nil && fn.Pos().IsValid() {
 		pos := fn.Prog.Fset.Position(fn.Pos())
-		return fmt.Sprintf("%s.init@%s:%d", pkgPath, filepath.Base(pos.Filename), pos.Line)
+		return fmt.Sprintf("%s.init@%s:%d:%d", pkgPath, filepath.Base(pos.Filename), pos.Line, pos.Column)
 	}
 	return pkgPath + "." + fn.Name()
 }
@@ -1105,9 +1110,9 @@ func funcFQNAt(pkgFQN string, d *ast.FuncDecl, fset *token.FileSet) string {
 	if d.Recv != nil || d.Name.Name != "init" || fset == nil {
 		return base
 	}
-	pos := fset.Position(d.Pos())
+	pos := fset.Position(d.Name.Pos())
 	file := filepath.Base(pos.Filename)
-	return fmt.Sprintf("%s@%s:%d", base, file, pos.Line)
+	return fmt.Sprintf("%s@%s:%d:%d", base, file, pos.Line, pos.Column)
 }
 
 func renderFunc(fset *token.FileSet, d *ast.FuncDecl) (sig, body string) {
@@ -1459,85 +1464,12 @@ func publishStagedSnapshot(ctx context.Context, sp *spanner.Client, repo, stagin
 	if err := row.Columns(&label, &commitSHA, &commitTime, &base, &parents, &branch, &symbolCount, &ingestedAt); err != nil {
 		return err
 	}
-	muts := []*spanner.Mutation{spanner.Replace("Snapshots",
-		[]string{"repo", "snapshot_id", "label", "commit_sha", "commit_time", "kind", "base_snapshot_id", "parent_snapshot_ids", "branch", "symbol_count", "ingested_at"},
-		[]interface{}{repo, snapshotID, label, commitSHA, commitTime, publishedKind, base, parents, branch, symbolCount, ingestedAt})}
-	params := map[string]interface{}{"repo": repo, "snap": stagingSnapshotID}
-	appendRows := func(sql string, scan func(*spanner.Row) (*spanner.Mutation, error)) error {
-		iter := sp.Single().Query(ctx, spanner.Statement{SQL: sql, Params: params})
-		defer iter.Stop()
-		for {
-			row, err := iter.Next()
-			if err == iterator.Done {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			mutation, err := scan(row)
-			if err != nil {
-				return err
-			}
-			muts = append(muts, mutation)
-		}
-	}
-	if err := appendRows(`SELECT symbol_id, fqn, content_hash, kind, file_path, line_start, line_end
-		FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
-		var symbolID, fqn, memberKind, filePath string
-		var hash spanner.NullString
-		var lineStart, lineEnd int64
-		if err := row.Columns(&symbolID, &fqn, &hash, &memberKind, &filePath, &lineStart, &lineEnd); err != nil {
-			return nil, err
-		}
-		return spanner.InsertOrUpdate("SnapshotMembers",
-			[]string{"repo", "snapshot_id", "symbol_id", "fqn", "content_hash", "kind", "file_path", "line_start", "line_end"},
-			[]interface{}{repo, snapshotID, symbolID, fqn, hash, memberKind, filePath, lineStart, lineEnd}), nil
-	}); err != nil {
-		return err
-	}
-	if err := appendRows(`SELECT symbol_id, dst_symbol_id, kind
-		FROM SnapshotEdges WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
-		var src, dst, edgeKind string
-		if err := row.Columns(&src, &dst, &edgeKind); err != nil {
-			return nil, err
-		}
-		return spanner.InsertOrUpdate("SnapshotEdges",
-			[]string{"repo", "snapshot_id", "symbol_id", "dst_symbol_id", "kind"},
-			[]interface{}{repo, snapshotID, src, dst, edgeKind}), nil
-	}); err != nil {
-		return err
-	}
-	if err := appendRows(`SELECT file_path, content_sha, is_go, file_order
-		FROM SnapshotFiles WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
-		var filePath, contentSHA string
-		var isGo bool
-		var order int64
-		if err := row.Columns(&filePath, &contentSHA, &isGo, &order); err != nil {
-			return nil, err
-		}
-		return spanner.InsertOrUpdate("SnapshotFiles",
-			[]string{"repo", "snapshot_id", "file_path", "content_sha", "is_go", "file_order"},
-			[]interface{}{repo, snapshotID, filePath, contentSHA, isGo, order}), nil
-	}); err != nil {
-		return err
-	}
-	if err := appendRows(`SELECT file_path, chunk_index, chunk_kind, symbol_fqns, content_sha, blank_before
-		FROM GoFileChunks WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
-		var filePath, chunkKind, contentSHA string
-		var chunkIndex int64
-		var fqns []string
-		var blank spanner.NullBool
-		if err := row.Columns(&filePath, &chunkIndex, &chunkKind, &fqns, &contentSHA, &blank); err != nil {
-			return nil, err
-		}
-		return spanner.InsertOrUpdate("GoFileChunks",
-			[]string{"repo", "snapshot_id", "file_path", "chunk_index", "chunk_kind", "symbol_fqns", "content_sha", "blank_before"},
-			[]interface{}{repo, snapshotID, filePath, chunkIndex, chunkKind, fqns, contentSHA, blank}), nil
-	}); err != nil {
-		return err
-	}
-	muts = append(muts, spanner.Delete("Snapshots", spanner.Key{repo, stagingSnapshotID}))
-	_, err = sp.Apply(ctx, muts)
+	// The completed staging row is the immutable storage generation. Publishing
+	// flips one logical pointer, independent of the number or size of children.
+	mut := spanner.InsertOrUpdate("Snapshots",
+		[]string{"repo", "snapshot_id", "label", "commit_sha", "commit_time", "kind", "base_snapshot_id", "storage_snapshot_id", "parent_snapshot_ids", "branch", "symbol_count", "ingested_at"},
+		[]interface{}{repo, snapshotID, label, commitSHA, commitTime, publishedKind, base, stagingSnapshotID, parents, branch, symbolCount, ingestedAt})
+	_, err = sp.Apply(ctx, []*spanner.Mutation{mut})
 	return err
 }
 
@@ -2069,15 +2001,23 @@ func cmdListCommits(ctx context.Context, args []string) error {
 
 // ---------- prune ----------
 
-// deleteSnapshotData removes a snapshot and every interleaved child
-// (SnapshotMembers, SnapshotEdges, SnapshotFiles). The big children are deleted
-// via partitioned DML (each splits by its own key ranges); the parent-row
-// delete then cascades anything remaining. Used by `prune` AND by doIngest —
-// a re-ingest of a snapshot_id must fully REPLACE it, never merge: an
-// InsertOrUpdate-only rewrite would leave stale members/edges from a prior
-// ingest whenever the extraction changed (e.g. package- vs file-granular
-// IMPORTS, or edges a corrected pass no longer emits).
+// deleteSnapshotData removes a public logical snapshot. Immutable generations
+// are retained because a reader may already have resolved the old pointer; a
+// later lifecycle policy may reclaim generations that are proven unreachable.
+// Legacy snapshots have interleaved children under their own logical ID, which
+// Spanner removes with the parent cascade.
 func deleteSnapshotData(ctx context.Context, sp *spanner.Client, repo, snap string) error {
+	if _, err := sp.Apply(ctx, []*spanner.Mutation{
+		spanner.Delete("Snapshots", spanner.Key{repo, snap}),
+	}); err != nil {
+		return fmt.Errorf("delete snapshot row: %w", err)
+	}
+	return nil
+}
+
+// deleteSnapshotGenerationData is only for a private generation that has been
+// proven not to be referenced by its logical snapshot row.
+func deleteSnapshotGenerationData(ctx context.Context, sp *spanner.Client, repo, snap string) error {
 	params := map[string]interface{}{"repo": repo, "snap": snap}
 	for _, t := range []string{"SnapshotEdges", "SnapshotMembers", "SnapshotFiles", "GoFileChunks"} {
 		if _, err := sp.PartitionedUpdate(ctx, spanner.Statement{

@@ -102,10 +102,13 @@ func doLineage(ctx context.Context, sp *spanner.Client, fqn string) (*LineageRes
 
 	// Which snapshots contain a symbol in the alias chain, and at what version.
 	stmt := spanner.Statement{
-		SQL: `SELECT sm.snapshot_id, sm.content_hash
-		      FROM SnapshotMembers AS sm
-		      JOIN Snapshots AS s ON s.repo = sm.repo AND s.snapshot_id = sm.snapshot_id
-		      WHERE sm.repo = @repo AND sm.symbol_id IN UNNEST(@sids) AND s.kind = 'ingested'`,
+		SQL: `SELECT s.snapshot_id, sm.content_hash
+		      FROM Snapshots AS s
+		      JOIN SnapshotMembers AS sm
+		        ON sm.repo = s.repo
+		       AND ((s.storage_snapshot_id IS NULL AND sm.snapshot_id = s.snapshot_id)
+		         OR sm.snapshot_id = s.storage_snapshot_id)
+		      WHERE s.repo = @repo AND sm.symbol_id IN UNNEST(@sids) AND s.kind = 'ingested'`,
 		Params: map[string]interface{}{"repo": repo, "sids": sids},
 	}
 	iter := sp.Single().Query(ctx, stmt)

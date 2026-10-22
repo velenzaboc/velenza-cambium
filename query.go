@@ -49,12 +49,9 @@ func isTestFuncName(fqn string) bool {
 // counterpart to semantic search. Filterable by kind, by fqn regex, and by
 // orphan status (zero incoming non-DECLARES edges, excluding entrypoints).
 func doListSymbols(ctx context.Context, sp *spanner.Client, repo, snapshotID, kindFilter, matchRegex string, orphansOnly bool, limit int) ([]SymbolRow, error) {
-	ok, err := snapshotExists(ctx, sp, repo, snapshotID)
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
 	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested", snapshotID, repo)
+		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", snapshotID, repo, err)
 	}
 	var re *regexp.Regexp
 	if matchRegex != "" {
@@ -69,11 +66,11 @@ func doListSymbols(ctx context.Context, sp *spanner.Client, repo, snapshotID, ki
 	// production reaches it; a test symbol is orphan when nothing reaches it at
 	// all. Splitting the two means "production-dead" and "test-only" no longer
 	// look identical — which is exactly the distinction test ingestion buys.
-	edges, err := loadSnapshotEdges(ctx, sp, repo, snapshotID)
+	edges, err := loadSnapshotEdgesFromGeneration(ctx, sp, repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := snapshotMemberMeta(ctx, sp, repo, snapshotID)
+	meta, err := snapshotMemberMetaFromGeneration(ctx, sp, repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +90,7 @@ func doListSymbols(ctx context.Context, sp *spanner.Client, repo, snapshotID, ki
 	sql := `SELECT symbol_id, fqn, kind, file_path, line_start
 	        FROM SnapshotMembers
 	        WHERE repo = @repo AND snapshot_id = @snap`
-	params := map[string]interface{}{"repo": repo, "snap": snapshotID}
+	params := map[string]interface{}{"repo": repo, "snap": ref.StorageID}
 	if kindFilter != "" {
 		sql += ` AND kind = @kind`
 		params["kind"] = kindFilter
@@ -153,7 +150,7 @@ func isEntrypoint(fqn string) bool {
 	if i := strings.LastIndex(fqn, "."); i >= 0 {
 		leaf = fqn[i+1:]
 	}
-	if leaf == "main" || leaf == "init" {
+	if leaf == "main" || leaf == "init" || strings.HasPrefix(leaf, "init@") {
 		return true
 	}
 	for _, p := range []string{"Test", "Benchmark", "Fuzz", "Example"} {
@@ -198,12 +195,9 @@ type CoverageReport struct {
 }
 
 func doCoverage(ctx context.Context, sp *spanner.Client, repo, snapshotID string, untestedOnly bool) (*CoverageReport, error) {
-	ok, err := snapshotExists(ctx, sp, repo, snapshotID)
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
 	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested", snapshotID, repo)
+		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", snapshotID, repo, err)
 	}
 
 	type memberRow struct {
@@ -213,7 +207,7 @@ func doCoverage(ctx context.Context, sp *spanner.Client, repo, snapshotID string
 	members := map[string]memberRow{}
 	iter := sp.Single().Query(ctx, spanner.Statement{
 		SQL:    `SELECT symbol_id, fqn, kind, file_path, line_start FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": ref.StorageID},
 	})
 	for {
 		row, err := iter.Next()
@@ -234,7 +228,7 @@ func doCoverage(ctx context.Context, sp *spanner.Client, repo, snapshotID string
 	}
 	iter.Stop()
 
-	edges, err := loadSnapshotEdges(ctx, sp, repo, snapshotID)
+	edges, err := loadSnapshotEdgesFromGeneration(ctx, sp, repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
@@ -385,6 +379,10 @@ func doSearch(ctx context.Context, sp *spanner.Client, query, repo, snapshotID s
 	if limit <= 0 {
 		limit = 15
 	}
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
 	vecs, err := callEmbed(ctx, []string{query}, "RETRIEVAL_QUERY")
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -415,7 +413,7 @@ func doSearch(ctx context.Context, sp *spanner.Client, query, repo, snapshotID s
 		      ORDER BY t.distance
 		      LIMIT @lim`,
 		Params: map[string]interface{}{
-			"q": vecs[0], "repo": repo, "snap": snapshotID,
+			"q": vecs[0], "repo": repo, "snap": ref.StorageID,
 			"overfetch": int64(limit * 20), "lim": int64(limit),
 		},
 	}
@@ -449,51 +447,57 @@ func resolveFQN(ctx context.Context, sp *spanner.Client, fqn, pinSnap string) (s
 }
 
 func resolveFQNInRepo(ctx context.Context, sp *spanner.Client, fqn, pinRepo, pinSnap string) (symbolID, repo, snapshotID string, err error) {
-	var stmt spanner.Statement
+	symbolID, ref, err := resolveFQNRefInRepo(ctx, sp, fqn, pinRepo, pinSnap)
+	if err != nil {
+		return "", "", "", err
+	}
+	return symbolID, ref.Repo, ref.LogicalID, nil
+}
+
+func resolveFQNRefInRepo(ctx context.Context, sp *spanner.Client, fqn, pinRepo, pinSnap string) (string, snapshotRef, error) {
+	params := map[string]interface{}{"fqn": fqn}
+	repoClause := ""
+	snapshotClause := ""
+	if pinRepo != "" {
+		repoClause = " AND s.repo = @repo"
+		params["repo"] = pinRepo
+	}
 	if pinSnap != "" {
-		repoClause := ""
-		params := map[string]interface{}{"fqn": fqn, "snap": pinSnap}
-		if pinRepo != "" {
-			repoClause = " AND repo = @repo"
-			params["repo"] = pinRepo
-		}
-		stmt = spanner.Statement{
-			SQL: `SELECT symbol_id, repo, snapshot_id
-			      FROM SnapshotMembers
-			      WHERE fqn = @fqn AND snapshot_id = @snap` + repoClause + `
-			      ORDER BY repo`,
-			Params: params,
-		}
-	} else {
-		stmt = spanner.Statement{
-			SQL: `SELECT sm.symbol_id, sm.repo, sm.snapshot_id
-			      FROM SnapshotMembers AS sm
-			      JOIN Snapshots AS s ON s.repo = sm.repo AND s.snapshot_id = sm.snapshot_id
-			      WHERE sm.fqn = @fqn
-			      ORDER BY s.commit_time DESC`,
-			Params: map[string]interface{}{"fqn": fqn},
-		}
+		snapshotClause = " AND s.snapshot_id = @snap"
+		params["snap"] = pinSnap
+	}
+	stmt := spanner.Statement{
+		SQL: `SELECT sm.symbol_id, s.repo, s.snapshot_id, sm.snapshot_id
+		      FROM Snapshots AS s
+		      JOIN SnapshotMembers AS sm
+		        ON sm.repo = s.repo
+		       AND ((s.storage_snapshot_id IS NULL AND sm.snapshot_id = s.snapshot_id)
+		         OR sm.snapshot_id = s.storage_snapshot_id)
+		      WHERE sm.fqn = @fqn AND s.kind != 'staging'` + repoClause + snapshotClause + `
+		      ORDER BY s.commit_time DESC, s.repo`,
+		Params: params,
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
 	row, err := iter.Next()
 	if err == iterator.Done {
 		if pinSnap != "" {
-			return "", "", "", fmt.Errorf("no symbol %q in snapshot %q", fqn, pinSnap)
+			return "", snapshotRef{}, fmt.Errorf("no symbol %q in snapshot %q", fqn, pinSnap)
 		}
-		return "", "", "", fmt.Errorf("no symbol matches FQN %q — try code_graph_search first", fqn)
+		return "", snapshotRef{}, fmt.Errorf("no symbol matches FQN %q — try code_graph_search first", fqn)
 	}
 	if err != nil {
-		return "", "", "", err
+		return "", snapshotRef{}, err
 	}
-	if err := row.Columns(&symbolID, &repo, &snapshotID); err != nil {
-		return "", "", "", err
+	var symbolID, repo, snapshotID, storageID string
+	if err := row.Columns(&symbolID, &repo, &snapshotID, &storageID); err != nil {
+		return "", snapshotRef{}, err
 	}
 	if pinSnap != "" && pinRepo == "" {
 		if _, nextErr := iter.Next(); nextErr == nil {
-			return "", "", "", fmt.Errorf("symbol %q in snapshot %q is ambiguous across repositories", fqn, pinSnap)
+			return "", snapshotRef{}, fmt.Errorf("symbol %q in snapshot %q is ambiguous across repositories", fqn, pinSnap)
 		} else if nextErr != iterator.Done {
-			return "", "", "", nextErr
+			return "", snapshotRef{}, nextErr
 		}
 	} else if pinSnap == "" && pinRepo == "" {
 		for {
@@ -502,18 +506,18 @@ func resolveFQNInRepo(ctx context.Context, sp *spanner.Client, fqn, pinRepo, pin
 				break
 			}
 			if nextErr != nil {
-				return "", "", "", nextErr
+				return "", snapshotRef{}, nextErr
 			}
-			var nextSymbolID, nextRepo, nextSnapshot string
-			if err := next.Columns(&nextSymbolID, &nextRepo, &nextSnapshot); err != nil {
-				return "", "", "", err
+			var nextSymbolID, nextRepo, nextSnapshot, nextStorage string
+			if err := next.Columns(&nextSymbolID, &nextRepo, &nextSnapshot, &nextStorage); err != nil {
+				return "", snapshotRef{}, err
 			}
 			if nextRepo != repo {
-				return "", "", "", fmt.Errorf("symbol %q is ambiguous across repositories; pin a repository context", fqn)
+				return "", snapshotRef{}, fmt.Errorf("symbol %q is ambiguous across repositories; pin a repository context", fqn)
 			}
 		}
 	}
-	return symbolID, repo, snapshotID, nil
+	return symbolID, snapshotRef{Repo: repo, LogicalID: snapshotID, StorageID: storageID}, nil
 }
 
 // ---------- edges ----------
@@ -530,13 +534,21 @@ type EdgeRow struct {
 // whole-program resolution is snapshot-dependent. Snapshots written before
 // that marker retain read compatibility with legacy SymbolEdges.
 func loadSnapshotEdges(ctx context.Context, sp *spanner.Client, repo, snapshotID string) ([]EdgeRow, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return loadSnapshotEdgesFromGeneration(ctx, sp, repo, storageID)
+}
+
+func loadSnapshotEdgesFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) ([]EdgeRow, error) {
 	var out []EdgeRow
 	complete := false
 	stmt := spanner.Statement{
 		SQL: `SELECT symbol_id, dst_symbol_id, kind
 		      FROM SnapshotEdges
 		      WHERE repo = @repo AND snapshot_id = @snap`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	for {
@@ -569,7 +581,7 @@ func loadSnapshotEdges(ctx context.Context, sp *spanner.Client, repo, snapshotID
 		      JOIN SnapshotMembers AS sm
 		        ON sm.symbol_id = e.src_symbol_id AND sm.content_hash = e.src_content_hash
 		      WHERE sm.repo = @repo AND sm.snapshot_id = @snap`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter = sp.Single().Query(ctx, legacyStmt)
 	defer iter.Stop()
@@ -592,10 +604,18 @@ func loadSnapshotEdges(ctx context.Context, sp *spanner.Client, repo, snapshotID
 
 // snapshotMemberMeta returns fqn/file/line per symbol_id for a snapshot.
 func snapshotMemberMeta(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (map[string]NeighborResult, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return snapshotMemberMetaFromGeneration(ctx, sp, repo, storageID)
+}
+
+func snapshotMemberMetaFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) (map[string]NeighborResult, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT symbol_id, fqn, file_path, line_start
 		      FROM SnapshotMembers WHERE repo = @repo AND snapshot_id = @snap`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -631,16 +651,15 @@ func doNeighborsInRepo(ctx context.Context, sp *spanner.Client, fqn string, dept
 	if depth > 3 {
 		depth = 3 // guard against runaway fanout
 	}
-	rootID, repo, snapshotID, err := resolveFQNInRepo(ctx, sp, fqn, pinRepo, pinSnap)
+	rootID, ref, err := resolveFQNRefInRepo(ctx, sp, fqn, pinRepo, pinSnap)
 	if err != nil {
 		return nil, err
 	}
-
-	edges, err := loadSnapshotEdges(ctx, sp, repo, snapshotID)
+	edges, err := loadSnapshotEdgesFromGeneration(ctx, sp, ref.Repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := snapshotMemberMeta(ctx, sp, repo, snapshotID)
+	meta, err := snapshotMemberMetaFromGeneration(ctx, sp, ref.Repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
@@ -714,35 +733,36 @@ func doGet(ctx context.Context, sp *spanner.Client, fqn, pinSnap string) (*Symbo
 }
 
 func doGetInRepo(ctx context.Context, sp *spanner.Client, fqn, pinRepo, pinSnap string) (*SymbolDetail, error) {
-	symbolID, repo, snapshotID, err := resolveFQNInRepo(ctx, sp, fqn, pinRepo, pinSnap)
+	symbolID, ref, err := resolveFQNRefInRepo(ctx, sp, fqn, pinRepo, pinSnap)
 	if err != nil {
 		return nil, err
 	}
 	stmt := spanner.Statement{
-		SQL: `SELECT sm.fqn, sm.kind, sm.repo, sm.snapshot_id,
+		SQL: `SELECT sm.fqn, sm.kind, sm.repo,
 		             sm.file_path, sm.line_start, sm.line_end,
 		             sv.signature, sv.doc_comment, sv.body
 		      FROM SnapshotMembers AS sm
 		      LEFT JOIN SymbolVersions AS sv
 		        ON sv.symbol_id = sm.symbol_id AND sv.content_hash = sm.content_hash
 		      WHERE sm.repo = @repo AND sm.snapshot_id = @snap AND sm.symbol_id = @symbol`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID, "symbol": symbolID},
+		Params: map[string]interface{}{"repo": ref.Repo, "snap": ref.StorageID, "symbol": symbolID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
 	row, err := iter.Next()
 	if err == iterator.Done {
-		return nil, fmt.Errorf("resolved symbol %q disappeared from %s@%s", fqn, repo, snapshotID)
+		return nil, fmt.Errorf("resolved symbol %q disappeared from %s@%s", fqn, ref.Repo, ref.LogicalID)
 	}
 	if err != nil {
 		return nil, err
 	}
 	var s SymbolDetail
 	var sig, doc, body spanner.NullString
-	if err := row.Columns(&s.FQN, &s.Kind, &s.Repo, &s.SnapshotID, &s.FilePath, &s.LineStart, &s.LineEnd,
+	if err := row.Columns(&s.FQN, &s.Kind, &s.Repo, &s.FilePath, &s.LineStart, &s.LineEnd,
 		&sig, &doc, &body); err != nil {
 		return nil, err
 	}
+	s.SnapshotID = ref.LogicalID
 	if sig.Valid {
 		s.Signature = sig.StringVal
 	}
@@ -840,12 +860,9 @@ type AnnotationRow struct {
 // filtered by annotation type and/or spec_section. Makes sentinel-coverage
 // audits queryable.
 func doAnnotations(ctx context.Context, sp *spanner.Client, repo, snapshotID, filterType, filterSpec string) ([]AnnotationRow, error) {
-	ok, err := snapshotExists(ctx, sp, repo, snapshotID)
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
 	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested", snapshotID, repo)
+		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", snapshotID, repo, err)
 	}
 	stmt := spanner.Statement{
 		SQL: `SELECT sm.fqn, sv.volt_annotations
@@ -855,7 +872,7 @@ func doAnnotations(ctx context.Context, sp *spanner.Client, repo, snapshotID, fi
 		      WHERE sm.repo = @repo AND sm.snapshot_id = @snap
 		        AND sv.volt_annotations IS NOT NULL
 		      ORDER BY sm.fqn`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": ref.StorageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -957,11 +974,15 @@ func doDependents(ctx context.Context, sp *spanner.Client, fqn string) (*Depende
 	targetID := uuidFromFQN(fqn)
 	seen := map[Dependent]struct{}{}
 	for repo, snapshot := range latest {
-		edges, err := loadSnapshotEdges(ctx, sp, repo, snapshot)
+		ref, err := resolveSnapshotRef(ctx, sp, repo, snapshot)
 		if err != nil {
 			return nil, err
 		}
-		meta, err := snapshotMemberMeta(ctx, sp, repo, snapshot)
+		edges, err := loadSnapshotEdgesFromGeneration(ctx, sp, repo, ref.StorageID)
+		if err != nil {
+			return nil, err
+		}
+		meta, err := snapshotMemberMetaFromGeneration(ctx, sp, repo, ref.StorageID)
 		if err != nil {
 			return nil, err
 		}
@@ -1022,11 +1043,19 @@ type snapshotDiffMember struct {
 }
 
 func loadSnapshotDiffMembers(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (map[string]snapshotDiffMember, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return loadSnapshotDiffMembersFromGeneration(ctx, sp, repo, storageID)
+}
+
+func loadSnapshotDiffMembersFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) (map[string]snapshotDiffMember, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT symbol_id, fqn, kind, file_path, line_start, content_hash
 		      FROM SnapshotMembers
 		      WHERE repo = @repo AND snapshot_id = @snap`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -1053,20 +1082,19 @@ func sameContentHash(a, b spanner.NullString) bool {
 }
 
 func doDiff(ctx context.Context, sp *spanner.Client, repo, before, after string) (*DiffResult, error) {
-	for _, snap := range []string{before, after} {
-		ok, err := snapshotExists(ctx, sp, repo, snap)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, fmt.Errorf("snapshot %q for repo %q is not ingested — call code_graph_ingest with that repo at the right commit first", snap, repo)
-		}
+	beforeRef, err := resolveSnapshotRef(ctx, sp, repo, before)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", before, repo, err)
 	}
-	beforeMembers, err := loadSnapshotDiffMembers(ctx, sp, repo, before)
+	afterRef, err := resolveSnapshotRef(ctx, sp, repo, after)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", after, repo, err)
+	}
+	beforeMembers, err := loadSnapshotDiffMembersFromGeneration(ctx, sp, repo, beforeRef.StorageID)
 	if err != nil {
 		return nil, err
 	}
-	afterMembers, err := loadSnapshotDiffMembers(ctx, sp, repo, after)
+	afterMembers, err := loadSnapshotDiffMembersFromGeneration(ctx, sp, repo, afterRef.StorageID)
 	if err != nil {
 		return nil, err
 	}
