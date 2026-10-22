@@ -381,6 +381,141 @@ func auditAssertPublishedGeneration(t *testing.T, client *spanner.Client, repo, 
 	}
 }
 
+func auditSnapshotChildCount(t *testing.T, client *spanner.Client, table, repo, snapshot string) int64 {
+	t.Helper()
+	iter := client.Single().Query(context.Background(), spanner.Statement{
+		SQL:    fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE repo=@repo AND snapshot_id=@snapshot", table),
+		Params: map[string]any{"repo": repo, "snapshot": snapshot},
+	})
+	defer iter.Stop()
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatalf("count %s rows for %s@%s: %v", table, repo, snapshot, err)
+	}
+	var count int64
+	if err := row.Columns(&count); err != nil {
+		t.Fatalf("decode %s row count for %s@%s: %v", table, repo, snapshot, err)
+	}
+	return count
+}
+
+func TestAuditPruneProtectsPublishedGenerationsAndPreservesLegacyPartitionedDML(t *testing.T) {
+	var dmlMu sync.Mutex
+	partitionedDeletes := map[string]bool{}
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if execute, ok := req.(*spannerpb.ExecuteSqlRequest); ok {
+			sql := strings.ToUpper(strings.TrimSpace(execute.GetSql()))
+			for _, table := range []string{"SnapshotEdges", "SnapshotMembers", "SnapshotFiles", "GoFileChunks"} {
+				if strings.HasPrefix(sql, "DELETE FROM "+strings.ToUpper(table)+" ") {
+					dmlMu.Lock()
+					partitionedDeletes[table] = true
+					dmlMu.Unlock()
+				}
+			}
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+	client := newAuditEmulatorInterceptedDB(t, interceptor)
+	ctx := context.Background()
+
+	t.Run("referenced private generation is refused and remains readable", func(t *testing.T) {
+		repo := "prune-private-repo"
+		logical := strings.Repeat("e", 40)
+		generation := auditGeneration{
+			snapshotID: "prune-private-generation",
+			memberID:   "prune-private-member",
+			memberFQN:  "example.test/prune.Private",
+			targetID:   "prune-private-target",
+			fileBody:   "package prune\n\nfunc Private() int { return 1 }\n",
+			chunkBody:  "func Private() int { return 1 }",
+		}
+		auditSeedGeneration(t, client, repo, generation, "staging")
+		if err := publishStagedSnapshot(ctx, client, repo, generation.snapshotID, logical, "ingested"); err != nil {
+			t.Fatalf("publish generation: %v", err)
+		}
+		if err := deleteSnapshotData(ctx, client, repo, generation.snapshotID); err == nil {
+			t.Fatal("prune accepted a private generation referenced by a public logical snapshot")
+		}
+		auditAssertPublishedGeneration(t, client, repo, logical, generation)
+	})
+
+	t.Run("public logical prune retains an already resolved immutable generation", func(t *testing.T) {
+		repo := "prune-public-repo"
+		logical := strings.Repeat("f", 40)
+		generation := auditGeneration{
+			snapshotID: "prune-public-generation",
+			memberID:   "prune-public-member",
+			memberFQN:  "example.test/prune.Public",
+			targetID:   "prune-public-target",
+			fileBody:   "package prune\n\nfunc Public() int { return 2 }\n",
+			chunkBody:  "func Public() int { return 2 }",
+		}
+		auditSeedGeneration(t, client, repo, generation, "staging")
+		if err := publishStagedSnapshot(ctx, client, repo, generation.snapshotID, logical, "ingested"); err != nil {
+			t.Fatalf("publish generation: %v", err)
+		}
+		ref, err := resolveSnapshotRef(ctx, client, repo, logical)
+		if err != nil {
+			t.Fatalf("resolve public snapshot before prune: %v", err)
+		}
+		if err := deleteSnapshotData(ctx, client, repo, logical); err != nil {
+			t.Fatalf("prune public logical snapshot: %v", err)
+		}
+		if visible, err := snapshotExists(ctx, client, repo, logical); err != nil || visible {
+			t.Fatalf("pruned logical snapshot remains public: visible=%v err=%v", visible, err)
+		}
+		row, err := client.Single().ReadRow(ctx, "Snapshots", spanner.Key{repo, ref.StorageID}, []string{"kind"})
+		if err != nil {
+			t.Fatalf("public prune removed resolved immutable generation: %v", err)
+		}
+		var kind string
+		if err := row.Columns(&kind); err != nil || kind != "staging" {
+			t.Fatalf("retained generation kind=%q err=%v, want staging", kind, err)
+		}
+		members, err := snapshotMemberMetaFromGeneration(ctx, client, repo, ref.StorageID)
+		if err != nil || len(members) != 2 {
+			t.Fatalf("already-resolved generation members=%+v err=%v, want two", members, err)
+		}
+		files, err := loadSnapshotFilesFromGeneration(ctx, client, repo, ref.StorageID)
+		if err != nil || !bytes.Equal(auditFile(t, files, "generation.go"), []byte(generation.fileBody)) {
+			t.Fatalf("already-resolved generation files=%+v err=%v", files, err)
+		}
+	})
+
+	t.Run("legacy NULL generation uses partitioned child deletion", func(t *testing.T) {
+		repo := "prune-legacy-repo"
+		legacy := auditGeneration{
+			snapshotID: strings.Repeat("1", 40),
+			memberID:   "prune-legacy-member",
+			memberFQN:  "example.test/prune.Legacy",
+			targetID:   "prune-legacy-target",
+			fileBody:   "package prune\n\nfunc Legacy() int { return 3 }\n",
+			chunkBody:  "func Legacy() int { return 3 }",
+		}
+		auditSeedGeneration(t, client, repo, legacy, "ingested")
+		dmlMu.Lock()
+		partitionedDeletes = map[string]bool{}
+		dmlMu.Unlock()
+		if err := deleteSnapshotData(ctx, client, repo, legacy.snapshotID); err != nil {
+			t.Fatalf("prune legacy snapshot: %v", err)
+		}
+		for _, table := range []string{"SnapshotEdges", "SnapshotMembers", "SnapshotFiles", "GoFileChunks"} {
+			dmlMu.Lock()
+			seen := partitionedDeletes[table]
+			dmlMu.Unlock()
+			if !seen {
+				t.Errorf("legacy prune did not issue partitioned DELETE for %s", table)
+			}
+			if count := auditSnapshotChildCount(t, client, table, repo, legacy.snapshotID); count != 0 {
+				t.Errorf("legacy prune left %d %s row(s)", count, table)
+			}
+		}
+		if _, err := client.Single().ReadRow(ctx, "Snapshots", spanner.Key{repo, legacy.snapshotID}, []string{"kind"}); status.Code(err) != codes.NotFound {
+			t.Fatalf("legacy prune snapshot row error=%v, want NotFound", err)
+		}
+	})
+}
+
 func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *testing.T) {
 	var enabled atomic.Bool
 	var fileCommits atomic.Int32

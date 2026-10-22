@@ -398,6 +398,44 @@ func TestAuditC6SameLineInitDeclarationsRemainDistinctInSymbolsAndChunks(t *test
 	}
 }
 
+func TestAuditC6CoordinateQualifiedInitRemainsEntrypoint(t *testing.T) {
+	initFQNs := []string{
+		"example.test/multiinit.init@a.go:2:6",
+		"example.test/multiinit.init@same.go:3:17",
+	}
+	for _, fqn := range initFQNs {
+		if !isEntrypoint(fqn) {
+			t.Errorf("coordinate-qualified init %q was classified as an ordinary production function", fqn)
+		}
+	}
+	if isEntrypoint("example.test/multiinit.Initialize") {
+		t.Fatal("ordinary Initialize function was classified as an entrypoint")
+	}
+
+	client := newCodeGraphTestDB(t)
+	repo, snapshot := "multiinit", strings.Repeat("6", 40)
+	auditInsertSnapshot(t, client, repo, snapshot)
+	for _, fqn := range append(initFQNs, "example.test/multiinit.Initialize") {
+		auditInsertMember(t, client, repo, snapshot, uuidFromFQN(fqn), fqn, nil)
+	}
+	rows, err := doListSymbols(context.Background(), client, repo, snapshot, "func", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphans := map[string]bool{}
+	for _, row := range rows {
+		orphans[row.FQN] = row.Orphan
+	}
+	for _, fqn := range initFQNs {
+		if orphans[fqn] {
+			t.Errorf("list-symbols reported coordinate-qualified init %q as an orphan", fqn)
+		}
+	}
+	if !orphans["example.test/multiinit.Initialize"] {
+		t.Fatal("list-symbols stopped reporting an ordinary uncalled function as an orphan")
+	}
+}
+
 func TestAuditC7ShiftBoundMustConstrainTheShiftOperandOnAllPaths(t *testing.T) {
 	repo := newTrackedTestRepo(t, map[string]string{
 		"go.mod": "module example.test/shifts\n\ngo 1.27\n",
@@ -473,11 +511,30 @@ func SafeUnsigned(n uint) uint64 {
 func TestAuditC1LegacyInarchLeaseSupportsJSONAndTOMLRepresentations(t *testing.T) {
 	head := strings.Repeat("a", 64)
 	for _, tc := range []struct {
-		name    string
-		content string
+		name       string
+		content    string
+		wantBranch string
 	}{
-		{name: "historical JSON", content: `{"head_changeset_id":"` + head + `","bookmark":"legacy"}`},
-		{name: "native TOML in legacy filename", content: "head_changeset_id = \"" + head + "\"\nbookmark = \"native\"\n"},
+		{
+			name:       "historical JSON",
+			content:    `{"head_changeset_id":"` + head + `","bookmark":"legacy"}`,
+			wantBranch: "legacy",
+		},
+		{
+			name:       "historical JSON tolerates unrelated mixed-type metadata",
+			content:    `{"head_changeset_id":"` + head + `","bookmark":"mixed","epoch":7,"metadata":{"source":"legacy"}}`,
+			wantBranch: "mixed",
+		},
+		{
+			name:       "historical JSON preserves equals sign inside a string",
+			content:    `{"head_changeset_id":"` + head + `","bookmark":"topic=x"}`,
+			wantBranch: "topic=x",
+		},
+		{
+			name:       "native TOML in legacy filename",
+			content:    "head_changeset_id = \"" + head + "\"\nbookmark = \"native\"\n",
+			wantBranch: "native",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := t.TempDir()
@@ -492,12 +549,8 @@ func TestAuditC1LegacyInarchLeaseSupportsJSONAndTOMLRepresentations(t *testing.T
 			if err != nil || gotHead != head {
 				t.Errorf("inarchHead = %q, %v; want %q", gotHead, err, head)
 			}
-			wantBranch := "legacy"
-			if tc.name == "native TOML in legacy filename" {
-				wantBranch = "native"
-			}
-			if got := inarchBranch(repo); got != wantBranch {
-				t.Errorf("inarchBranch = %q, want %q", got, wantBranch)
+			if got := inarchBranch(repo); got != tc.wantBranch {
+				t.Errorf("inarchBranch = %q, want %q", got, tc.wantBranch)
 			}
 		})
 	}
