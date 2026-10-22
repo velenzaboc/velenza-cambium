@@ -125,20 +125,11 @@ func TestAuditC1ConsumesRealInarchWorkspaceWithoutGit(t *testing.T) {
 	if !reflect.DeepEqual(parents, []string{first}) {
 		t.Fatalf("persisted native parents = %v, want [%s]", parents, first)
 	}
-	members := client.Single().Query(context.Background(), spanner.Statement{
-		SQL:    "SELECT COUNT(*) FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap",
-		Params: map[string]any{"repo": stats.Repo, "snap": second},
-	})
-	memberRow, err := members.Next()
-	members.Stop()
+	members, err := snapshotMemberMeta(context.Background(), client, stats.Repo, second)
 	if err != nil {
 		t.Fatalf("read native snapshot members: %v", err)
 	}
-	var memberCount int64
-	if err := memberRow.Columns(&memberCount); err != nil {
-		t.Fatalf("decode native snapshot members: %v", err)
-	}
-	if memberCount == 0 {
+	if len(members) == 0 {
 		t.Fatal("native snapshot persisted no members")
 	}
 	files, err := loadSnapshotFiles(context.Background(), client, stats.Repo, second)
