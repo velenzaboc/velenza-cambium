@@ -403,19 +403,47 @@ func TestAuditC6CoordinateQualifiedInitRemainsEntrypoint(t *testing.T) {
 		"example.test/multiinit.init@a.go:2:6",
 		"example.test/multiinit.init@same.go:3:17",
 	}
+	repoPath := newTrackedTestRepo(t, map[string]string{
+		"go.mod":   "module example.test/multiinit\n\ngo 1.27\n",
+		"a.b@c.go": "package multiinit\n\nfunc init() {}\nfunc Initialize() {}\n",
+	})
+	syms, _, err := walkRepo(repoPath, "multiinit", strings.Repeat("6", 40), auditNoProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delimitedInitFQN := ""
+	ordinaryFQN := ""
+	for _, symbol := range syms {
+		if symbol.Kind != "func" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(strings.TrimSpace(symbol.Signature), "func init("):
+			delimitedInitFQN = symbol.FQN
+		case strings.HasSuffix(symbol.FQN, ".Initialize"):
+			ordinaryFQN = symbol.FQN
+		}
+	}
+	if !strings.Contains(delimitedInitFQN, "init@a.b@c.go:") {
+		t.Fatalf("walkRepo init FQN = %q, want coordinate-qualified a.b@c.go basename", delimitedInitFQN)
+	}
+	if ordinaryFQN == "" {
+		t.Fatal("walkRepo omitted the ordinary Initialize control")
+	}
+	initFQNs = append(initFQNs, delimitedInitFQN)
 	for _, fqn := range initFQNs {
 		if !isEntrypoint(fqn) {
 			t.Errorf("coordinate-qualified init %q was classified as an ordinary production function", fqn)
 		}
 	}
-	if isEntrypoint("example.test/multiinit.Initialize") {
+	if isEntrypoint(ordinaryFQN) {
 		t.Fatal("ordinary Initialize function was classified as an entrypoint")
 	}
 
 	client := newCodeGraphTestDB(t)
 	repo, snapshot := "multiinit", strings.Repeat("6", 40)
 	auditInsertSnapshot(t, client, repo, snapshot)
-	for _, fqn := range append(initFQNs, "example.test/multiinit.Initialize") {
+	for _, fqn := range append(initFQNs, ordinaryFQN) {
 		auditInsertMember(t, client, repo, snapshot, uuidFromFQN(fqn), fqn, nil)
 	}
 	rows, err := doListSymbols(context.Background(), client, repo, snapshot, "func", "", false, 0)
@@ -436,7 +464,7 @@ func TestAuditC6CoordinateQualifiedInitRemainsEntrypoint(t *testing.T) {
 			t.Errorf("list-symbols reported coordinate-qualified init %q as an orphan", fqn)
 		}
 	}
-	ordinaryOrphan, ok := orphans["example.test/multiinit.Initialize"]
+	ordinaryOrphan, ok := orphans[ordinaryFQN]
 	if !ok {
 		t.Fatal("list-symbols omitted the ordinary uncalled function control")
 	}
