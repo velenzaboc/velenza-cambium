@@ -401,15 +401,37 @@ func auditSnapshotChildCount(t *testing.T, client *spanner.Client, table, repo, 
 
 func TestAuditPruneProtectsPublishedGenerationsAndPreservesLegacyPartitionedDML(t *testing.T) {
 	var dmlMu sync.Mutex
+	partitionedTransactionIDs := map[string]struct{}{}
 	partitionedDeletes := map[string]bool{}
 	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		if execute, ok := req.(*spannerpb.ExecuteSqlRequest); ok {
-			sql := strings.ToUpper(strings.TrimSpace(execute.GetSql()))
-			for _, table := range []string{"SnapshotEdges", "SnapshotMembers", "SnapshotFiles", "GoFileChunks"} {
-				if strings.HasPrefix(sql, "DELETE FROM "+strings.ToUpper(table)+" ") {
+		if begin, ok := req.(*spannerpb.BeginTransactionRequest); ok && begin.GetOptions().GetPartitionedDml() != nil {
+			err := invoker(ctx, method, req, reply, cc, opts...)
+			if err == nil {
+				transaction, ok := reply.(*spannerpb.Transaction)
+				if ok && len(transaction.GetId()) != 0 {
 					dmlMu.Lock()
-					partitionedDeletes[table] = true
+					partitionedTransactionIDs[string(transaction.GetId())] = struct{}{}
 					dmlMu.Unlock()
+				}
+			}
+			return err
+		}
+		if execute, ok := req.(*spannerpb.ExecuteSqlRequest); ok {
+			selector := execute.GetTransaction()
+			partitioned := selector.GetBegin().GetPartitionedDml() != nil
+			if !partitioned && len(selector.GetId()) != 0 {
+				dmlMu.Lock()
+				_, partitioned = partitionedTransactionIDs[string(selector.GetId())]
+				dmlMu.Unlock()
+			}
+			if partitioned {
+				sql := strings.ToUpper(strings.TrimSpace(execute.GetSql()))
+				for _, table := range []string{"SnapshotEdges", "SnapshotMembers", "SnapshotFiles", "GoFileChunks"} {
+					if strings.HasPrefix(sql, "DELETE FROM "+strings.ToUpper(table)+" ") {
+						dmlMu.Lock()
+						partitionedDeletes[table] = true
+						dmlMu.Unlock()
+					}
 				}
 			}
 		}
@@ -494,6 +516,7 @@ func TestAuditPruneProtectsPublishedGenerationsAndPreservesLegacyPartitionedDML(
 		}
 		auditSeedGeneration(t, client, repo, legacy, "ingested")
 		dmlMu.Lock()
+		partitionedTransactionIDs = map[string]struct{}{}
 		partitionedDeletes = map[string]bool{}
 		dmlMu.Unlock()
 		if err := deleteSnapshotData(ctx, client, repo, legacy.snapshotID); err != nil {

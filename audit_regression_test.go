@@ -418,7 +418,7 @@ func TestAuditC6CoordinateQualifiedInitRemainsEntrypoint(t *testing.T) {
 	for _, fqn := range append(initFQNs, "example.test/multiinit.Initialize") {
 		auditInsertMember(t, client, repo, snapshot, uuidFromFQN(fqn), fqn, nil)
 	}
-	rows, err := doListSymbols(context.Background(), client, repo, snapshot, "func", 0)
+	rows, err := doListSymbols(context.Background(), client, repo, snapshot, "func", "", false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,11 +427,20 @@ func TestAuditC6CoordinateQualifiedInitRemainsEntrypoint(t *testing.T) {
 		orphans[row.FQN] = row.Orphan
 	}
 	for _, fqn := range initFQNs {
-		if orphans[fqn] {
+		orphan, ok := orphans[fqn]
+		if !ok {
+			t.Errorf("list-symbols omitted coordinate-qualified init %q", fqn)
+			continue
+		}
+		if orphan {
 			t.Errorf("list-symbols reported coordinate-qualified init %q as an orphan", fqn)
 		}
 	}
-	if !orphans["example.test/multiinit.Initialize"] {
+	ordinaryOrphan, ok := orphans["example.test/multiinit.Initialize"]
+	if !ok {
+		t.Fatal("list-symbols omitted the ordinary uncalled function control")
+	}
+	if !ordinaryOrphan {
 		t.Fatal("list-symbols stopped reporting an ordinary uncalled function as an orphan")
 	}
 }
