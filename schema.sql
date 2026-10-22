@@ -25,13 +25,9 @@ CREATE TABLE SymbolVersions (
   created_at       TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp=true),
 ) PRIMARY KEY (symbol_id, content_hash);
 
--- SymbolEdges: edges whose SOURCE is a content-bearing symbol, keyed by the
--- source symbol-VERSION. An edge from a function is a pure function of that
--- function's body + resolution context (symbol_id encodes the package), so it
--- is written once per (src_symbol_id, src_content_hash) and reused by every
--- snapshot that contains that version — the cache that makes history replay
--- affordable. (CHA interface-dispatch edges are frozen at first ingest of the
--- source version; see ROADMAP.)
+-- SymbolEdges: legacy version-keyed edge rows retained for read compatibility.
+-- Current ingestion writes complete context-dependent edge sets to
+-- SnapshotEdges because interface and call resolution depend on the snapshot.
 CREATE TABLE SymbolEdges (
   src_symbol_id    STRING(36) NOT NULL,
   src_content_hash STRING(64) NOT NULL,
@@ -41,8 +37,9 @@ CREATE TABLE SymbolEdges (
 
 CREATE INDEX SymbolEdgesByDst ON SymbolEdges(dst_symbol_id);
 
--- Snapshots: a named set of symbol-versions. parent_snapshot_ids records the
--- git DAG (a merge has 2+ parents); branch is the ref it was ingested under.
+-- Snapshots: a named set of symbol-versions. storage_snapshot_id atomically
+-- selects an immutable child generation (NULL means legacy children use the
+-- logical snapshot_id). parent_snapshot_ids records the commit DAG.
 CREATE TABLE Snapshots (
   repo                STRING(128) NOT NULL,
   snapshot_id         STRING(64)  NOT NULL,
@@ -51,6 +48,7 @@ CREATE TABLE Snapshots (
   commit_time         TIMESTAMP,
   kind                STRING(20)  NOT NULL,
   base_snapshot_id    STRING(64),
+  storage_snapshot_id STRING(64),
   parent_snapshot_ids ARRAY<STRING(64)>,
   branch              STRING(256),
   symbol_count        INT64       NOT NULL,
@@ -80,9 +78,9 @@ CREATE INDEX SnapshotMembersByContentHash
 CREATE INDEX SnapshotMembersBySymbol
   ON SnapshotMembers(symbol_id);
 
--- SnapshotEdges: structural edges only (DECLARES, IMPORTS) — their source is a
--- package or file, which has no content body, so they cannot be version-keyed.
--- Small (~5k/snapshot). Content-sourced edges live in SymbolEdges.
+-- SnapshotEdges: the complete derived edge set for one repository snapshot.
+-- Resolution depends on the whole analysis context, so even an unchanged
+-- source body may have different CALLS/IMPLEMENTS edges in another snapshot.
 CREATE TABLE SnapshotEdges (
   repo          STRING(128) NOT NULL,
   snapshot_id   STRING(64)  NOT NULL,

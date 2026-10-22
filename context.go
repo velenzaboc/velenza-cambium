@@ -21,6 +21,44 @@ type cgContext struct {
 	SnapshotID string `json:"snapshot_id"`
 }
 
+// snapshotRef keeps the public identity separate from the immutable generation
+// that owns the snapshot's child rows. Resolve it once per public operation so
+// a concurrent republication cannot mix child generations.
+type snapshotRef struct {
+	Repo      string
+	LogicalID string
+	StorageID string
+}
+
+func resolveSnapshotRef(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (snapshotRef, error) {
+	row, err := sp.Single().ReadRow(ctx, "Snapshots", spanner.Key{repo, snapshotID},
+		[]string{"kind", "storage_snapshot_id"})
+	if err != nil {
+		return snapshotRef{}, err
+	}
+	var kind string
+	var storage spanner.NullString
+	if err := row.Columns(&kind, &storage); err != nil {
+		return snapshotRef{}, err
+	}
+	if kind == "staging" {
+		return snapshotRef{}, fmt.Errorf("snapshot %q for repo %q is private staging data", snapshotID, repo)
+	}
+	physical := snapshotID
+	if storage.Valid && storage.StringVal != "" {
+		physical = storage.StringVal
+	}
+	return snapshotRef{Repo: repo, LogicalID: snapshotID, StorageID: physical}, nil
+}
+
+func resolveSnapshotStorageID(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (string, error) {
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return "", err
+	}
+	return ref.StorageID, nil
+}
+
 func contextFilePath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -82,7 +120,7 @@ func repoSuffix(repo string) string {
 // snapshotRepo returns the repo a snapshot id belongs to.
 func snapshotRepo(ctx context.Context, sp *spanner.Client, snapshotID string) (string, error) {
 	iter := sp.Single().Query(ctx, spanner.Statement{
-		SQL:    `SELECT repo FROM Snapshots WHERE snapshot_id = @snap LIMIT 1`,
+		SQL:    `SELECT repo FROM Snapshots WHERE snapshot_id = @snap AND kind != 'staging' ORDER BY repo`,
 		Params: map[string]interface{}{"snap": snapshotID},
 	})
 	defer iter.Stop()
@@ -95,6 +133,11 @@ func snapshotRepo(ctx context.Context, sp *spanner.Client, snapshotID string) (s
 	}
 	var repo string
 	if err := row.Columns(&repo); err != nil {
+		return "", err
+	}
+	if _, err := iter.Next(); err == nil {
+		return "", fmt.Errorf("snapshot %q is ambiguous across repositories; pin it with `use <repo> <snapshot>`", snapshotID)
+	} else if err != iterator.Done {
 		return "", err
 	}
 	return repo, nil

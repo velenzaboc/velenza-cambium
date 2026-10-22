@@ -54,15 +54,12 @@ func doFindings(ctx context.Context, sp *spanner.Client, repo, snapshotID string
 	if limit <= 0 {
 		limit = 50
 	}
-	ok, err := snapshotExists(ctx, sp, repo, snapshotID)
+	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
 	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested — call code_graph_ingest first", snapshotID, repo)
+		return nil, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", snapshotID, repo, err)
 	}
 
-	syms, err := findingSymbols(ctx, sp, repo, snapshotID)
+	syms, err := findingSymbolsFromGeneration(ctx, sp, repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +79,7 @@ func doFindings(ctx context.Context, sp *spanner.Client, repo, snapshotID string
 		}
 	}
 
-	edgeList, err := loadSnapshotEdges(ctx, sp, repo, snapshotID)
+	edgeList, err := loadSnapshotEdgesFromGeneration(ctx, sp, repo, ref.StorageID)
 	if err != nil {
 		return nil, err
 	}
@@ -186,11 +183,19 @@ func mineMisuse(syms []findingSymbol, embByHash map[string][]float32, edges []Ed
 // nature — including them floods the duplication ranking and buries the real
 // production pairs. Excluding them at the source cleans both miners at once.
 func findingSymbols(ctx context.Context, sp *spanner.Client, repo, snapshotID string) ([]findingSymbol, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return findingSymbolsFromGeneration(ctx, sp, repo, storageID)
+}
+
+func findingSymbolsFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) ([]findingSymbol, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT symbol_id, fqn, content_hash, file_path
 		      FROM SnapshotMembers
 		      WHERE repo = @repo AND snapshot_id = @snap AND content_hash IS NOT NULL`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()

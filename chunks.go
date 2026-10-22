@@ -8,7 +8,6 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -85,7 +84,7 @@ func decomposeGoFile(path string, src []byte, pkgPath string) []goChunk {
 			kind = "import"
 		}
 		spans = append(spans, span{start, end, goChunk{
-			kind: kind, text: string(src[start:end]), fqns: declFQNs(d, pkgPath),
+			kind: kind, text: string(src[start:end]), fqns: declFQNsAt(d, pkgPath, fset),
 		}})
 	}
 
@@ -143,10 +142,14 @@ func declDoc(d ast.Decl) *ast.CommentGroup {
 // one for a func/method, one per type, one per var/const name (a grouped
 // var(...)/const(...) declares several), none for an import.
 func declFQNs(d ast.Decl, pkgPath string) []string {
+	return declFQNsAt(d, pkgPath, nil)
+}
+
+func declFQNsAt(d ast.Decl, pkgPath string, fset *token.FileSet) []string {
 	var out []string
 	switch x := d.(type) {
 	case *ast.FuncDecl:
-		out = append(out, funcFQN(pkgPath, x))
+		out = append(out, funcFQNAt(pkgPath, x, fset))
 	case *ast.GenDecl:
 		for _, spec := range x.Specs {
 			switch s := spec.(type) {
@@ -190,11 +193,16 @@ func pkgPathForFile(modPath, relPath string) string {
 // GoFileChunks + DeclSource for this snapshot.
 func captureGoChunks(ctx context.Context, sp *spanner.Client, repoPath, repoName, snapshotID string, progress ProgressFunc) error {
 	modPath := modulePath(repoPath)
-	out, err := exec.Command("git", "-C", repoPath, "ls-files", "-z", "*.go").Output()
+	tracked, err := listTrackedFiles(repoPath)
 	if err != nil {
-		return fmt.Errorf("git ls-files go: %w", err)
+		return fmt.Errorf("list tracked Go files: %w", err)
 	}
-	paths := strings.Split(strings.TrimRight(string(out), "\x00"), "\x00")
+	paths := make([]string, 0, len(tracked))
+	for _, path := range tracked {
+		if strings.HasSuffix(path, ".go") {
+			paths = append(paths, path)
+		}
+	}
 	sort.Strings(paths)
 
 	type chunkRow struct {
@@ -300,13 +308,21 @@ type chunkText struct {
 // loadGoFileChunks returns, per .go file_path, the snapshot's ordered chunk
 // texts (GoFileChunks joined to DeclSource).
 func loadGoFileChunks(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (map[string][]chunkText, error) {
+	storageID, err := resolveSnapshotStorageID(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	return loadGoFileChunksFromGeneration(ctx, sp, repo, storageID)
+}
+
+func loadGoFileChunksFromGeneration(ctx context.Context, sp *spanner.Client, repo, storageID string) (map[string][]chunkText, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT c.file_path, c.chunk_index, c.chunk_kind, c.blank_before, d.source
 		      FROM GoFileChunks AS c
 		      JOIN DeclSource AS d ON d.content_sha = c.content_sha
 		      WHERE c.repo = @repo AND c.snapshot_id = @snap
 		      ORDER BY c.file_path, c.chunk_index`,
-		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
+		Params: map[string]interface{}{"repo": repo, "snap": storageID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
