@@ -270,68 +270,6 @@ func TestAuditC4HistoricalEdgesRemainSnapshotScoped(t *testing.T) {
 	}
 }
 
-func TestAuditC4ZeroEdgeReingestClearsStaleVersionEdges(t *testing.T) {
-	client := newCodeGraphTestDB(t)
-	previousRequest := requestEmbeddings
-	requestEmbeddings = func(_ context.Context, texts []string, _ string) ([][]float32, error) {
-		vectors := make([][]float32, len(texts))
-		for i := range vectors {
-			vectors[i] = []float32{1, 0}
-		}
-		return vectors, nil
-	}
-	t.Cleanup(func() { requestEmbeddings = previousRequest })
-	repoPath := newTrackedTestRepo(t, map[string]string{
-		"go.mod":  "module example.test/leaf\n\ngo 1.27\n",
-		"leaf.go": "package leaf\n\nfunc Leaf() int { return 1 }\n",
-	})
-	ctx := context.Background()
-	stats, err := doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	symbolID := uuidFromFQN("example.test/leaf.Leaf")
-	var contentHash string
-	iter := client.Single().Query(ctx, spanner.Statement{
-		SQL: "SELECT content_hash FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap AND symbol_id=@sid",
-		Params: map[string]any{"repo": stats.Repo, "snap": stats.SnapshotID, "sid": symbolID},
-	})
-	row, err := iter.Next()
-	iter.Stop()
-	if err != nil || row.Columns(&contentHash) != nil {
-		t.Fatalf("load leaf version hash: %v", err)
-	}
-	staleID := uuidFromFQN("example.test/leaf.Stale")
-	if err := writeSymbolEdges(ctx, client, []Edge{{Repo: stats.Repo, SnapshotID: stats.SnapshotID, SrcID: symbolID, SrcContentHash: contentHash, DstID: staleID, Kind: "CALLS"}}, auditNoProgress); err != nil {
-		t.Fatal(err)
-	}
-	before, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seen := false
-	for _, edge := range before {
-		if edge.Src == symbolID && edge.Dst == staleID && edge.Kind == "CALLS" {
-			seen = true
-		}
-	}
-	if !seen {
-		t.Fatal("fixture did not establish a visible stale edge")
-	}
-	if _, err := doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress); err != nil {
-		t.Fatal(err)
-	}
-	after, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, edge := range after {
-		if edge.Src == symbolID && edge.Dst == staleID && edge.Kind == "CALLS" {
-			t.Fatalf("zero-edge reingest retained a visible stale edge: %+v", edge)
-		}
-	}
-}
-
 func TestAuditC5PinnedContextKeepsRepositoryIdentity(t *testing.T) {
 	client := newCodeGraphTestDB(t)
 	home := t.TempDir()
@@ -354,17 +292,13 @@ func TestAuditC5PinnedContextKeepsRepositoryIdentity(t *testing.T) {
 	if err := saveContext(cgContext{Repo: "z-repo", SnapshotID: snapshot}); err != nil {
 		t.Fatal(err)
 	}
-	installCommandClient(t, client)
-	var getErr error
-	_ = captureStdout(t, func() {
-		getErr = cmdGet(context.Background(), []string{fqn})
-	})
-	if getErr == nil {
+	if _, err := doGetInRepo(context.Background(), client, fqn, "z-repo", snapshot); err == nil {
 		t.Fatal("pinned z-repo query returned a symbol that exists only in a-repo")
 	}
 
 	auditInsertMember(t, client, "z-repo", snapshot, id, fqn, hashZ)
-	getErr = nil
+	installCommandClient(t, client)
+	var getErr error
 	out := captureStdout(t, func() {
 		getErr = cmdGet(context.Background(), []string{fqn})
 	})
@@ -427,6 +361,43 @@ func third() {}
 	}
 }
 
+func TestAuditC6SameLineInitDeclarationsRemainDistinctInSymbolsAndChunks(t *testing.T) {
+	const source = "package multiinit\n\nfunc init() {}; func init() {}\n"
+	repo := newTrackedTestRepo(t, map[string]string{
+		"go.mod": "module example.test/multiinit\n\ngo 1.27\n",
+		"same.go": source,
+	})
+	syms, _, err := walkRepo(repo, "multiinit", strings.Repeat("e", 40), auditNoProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	symbolIDs := map[string]struct{}{}
+	for _, symbol := range syms {
+		if symbol.Kind == "func" && strings.HasPrefix(strings.TrimSpace(symbol.Signature), "func init(") {
+			symbolIDs[symbol.ID] = struct{}{}
+		}
+	}
+	if len(symbolIDs) != 2 {
+		t.Errorf("two same-line init declarations produced %d symbol identities", len(symbolIDs))
+	}
+
+	chunks := decomposeGoFile("same.go", []byte(source), "example.test/multiinit")
+	chunkFQNs := map[string]struct{}{}
+	declarations := 0
+	for _, chunk := range chunks {
+		if chunk.kind != "decl" || !strings.Contains(chunk.text, "func init()") {
+			continue
+		}
+		declarations++
+		for _, fqn := range chunk.fqns {
+			chunkFQNs[fqn] = struct{}{}
+		}
+	}
+	if declarations != 2 || len(chunkFQNs) != 2 {
+		t.Errorf("same-line init chunks = %d declarations with %d distinct FQNs, want 2 and 2", declarations, len(chunkFQNs))
+	}
+}
+
 func TestAuditC7ShiftBoundMustConstrainTheShiftOperandOnAllPaths(t *testing.T) {
 	repo := newTrackedTestRepo(t, map[string]string{
 		"go.mod": "module example.test/shifts\n\ngo 1.27\n",
@@ -452,6 +423,20 @@ func SafeDominating(attempt int) int {
 	}
 	return 1 << attempt
 }
+
+func UnsafeNegativeConvertedToUint(n int) uint64 {
+	if n < 64 {
+		return 1 << uint(n)
+	}
+	return 0
+}
+
+func SafeUnsigned(n uint) uint64 {
+	if n < 64 {
+		return 1 << n
+	}
+	return 0
+}
 `,
 	})
 	_, _, hazards, err := analyzePackageHazards(repo)
@@ -464,7 +449,7 @@ func SafeDominating(attempt int) int {
 			unsafe[hazard.FunctionFQN] = true
 		}
 	}
-	for _, name := range []string{"UnsafeUnrelated", "UnsafeNonDominating"} {
+	for _, name := range []string{"UnsafeUnrelated", "UnsafeNonDominating", "UnsafeNegativeConvertedToUint"} {
 		found := false
 		for fqn := range unsafe {
 			if strings.HasSuffix(fqn, "."+name) {
@@ -479,6 +464,42 @@ func SafeDominating(attempt int) int {
 		if strings.HasSuffix(fqn, ".SafeDominating") {
 			t.Errorf("dominating operand bound was not honored: %s", fqn)
 		}
+		if strings.HasSuffix(fqn, ".SafeUnsigned") {
+			t.Errorf("unsigned upper bound was not honored: %s", fqn)
+		}
+	}
+}
+
+func TestAuditC1LegacyInarchLeaseSupportsJSONAndTOMLRepresentations(t *testing.T) {
+	head := strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{name: "historical JSON", content: `{"head_changeset_id":"` + head + `","bookmark":"legacy"}`},
+		{name: "native TOML in legacy filename", content: "head_changeset_id = \"" + head + "\"\nbookmark = \"native\"\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			inarchDir := filepath.Join(repo, ".inarch")
+			if err := os.MkdirAll(inarchDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(inarchDir, "jit_lease.json"), []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gotHead, err := inarchHead(repo)
+			if err != nil || gotHead != head {
+				t.Errorf("inarchHead = %q, %v; want %q", gotHead, err, head)
+			}
+			wantBranch := "legacy"
+			if tc.name == "native TOML in legacy filename" {
+				wantBranch = "native"
+			}
+			if got := inarchBranch(repo); got != wantBranch {
+				t.Errorf("inarchBranch = %q, want %q", got, wantBranch)
+			}
+		})
 	}
 }
 

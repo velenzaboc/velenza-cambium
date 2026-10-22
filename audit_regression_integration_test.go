@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,6 +69,10 @@ func auditInstallEmbeddings(t *testing.T) {
 	t.Cleanup(func() { requestEmbeddings = previous })
 }
 
+func auditPassInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	return invoker(ctx, method, req, reply, cc, opts...)
+}
+
 func TestAuditC1ConsumesRealInarchWorkspaceWithoutGit(t *testing.T) {
 	binary := os.Getenv("VELENZA_INR_BIN")
 	if binary == "" {
@@ -97,7 +102,7 @@ func TestAuditC1ConsumesRealInarchWorkspaceWithoutGit(t *testing.T) {
 		t.Errorf("native parents = %v, %v; want [%s]", got, err, first)
 	}
 
-	client := newAuditDB(t)
+	client := newAuditEmulatorInterceptedDB(t, auditPassInterceptor)
 	auditInstallEmbeddings(t)
 	stats, err := doIngest(context.Background(), client, repo, ingestOpts{}, auditNoProgress)
 	if err != nil {
@@ -151,7 +156,7 @@ func newAuditEmulatorInterceptedDB(t *testing.T, interceptor grpc.UnaryClientInt
 	t.Helper()
 	host := strings.TrimSpace(os.Getenv("SPANNER_EMULATOR_HOST"))
 	if host == "" {
-		t.Fatal("C2 integration regression requires SPANNER_EMULATOR_HOST")
+		t.Fatal("Cambium integration regressions require SPANNER_EMULATOR_HOST")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -169,8 +174,8 @@ func newAuditEmulatorInterceptedDB(t *testing.T, interceptor grpc.UnaryClientInt
 
 	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 	projectID := "cambium-audit"
-	instanceID := "c2-" + suffix
-	databaseID := "c2-" + suffix
+	instanceID := "audit-" + suffix
+	databaseID := "audit-" + suffix
 	instancePath := fmt.Sprintf("projects/%s/instances/%s", projectID, instanceID)
 	createInstance, err := instanceAdmin.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 		Parent:     "projects/" + projectID,
@@ -242,6 +247,37 @@ func auditCommitWritesTable(req any, table string) bool {
 		}
 	}
 	return false
+}
+
+func auditCommitDeletesTable(req any, table string) bool {
+	commit, ok := req.(*spannerpb.CommitRequest)
+	if !ok {
+		return false
+	}
+	for _, mutation := range commit.GetMutations() {
+		if deletion := mutation.GetDelete(); deletion != nil && deletion.GetTable() == table {
+			return true
+		}
+	}
+	return false
+}
+
+func auditSnapshotMemberCount(t *testing.T, client *spanner.Client, repo, snapshot string) int64 {
+	t.Helper()
+	iter := client.Single().Query(context.Background(), spanner.Statement{
+		SQL:    "SELECT COUNT(*) FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap",
+		Params: map[string]any{"repo": repo, "snap": snapshot},
+	})
+	defer iter.Stop()
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatalf("count snapshot members: %v", err)
+	}
+	var count int64
+	if err := row.Columns(&count); err != nil {
+		t.Fatalf("decode snapshot member count: %v", err)
+	}
+	return count
 }
 
 func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *testing.T) {
@@ -320,5 +356,304 @@ func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *tes
 	}
 	if got := auditFile(t, afterRetry, "large.txt"); !bytes.Equal(got, newBytes) {
 		t.Fatalf("retried large file length/content = %d bytes, want complete %d-byte content", len(got), len(newBytes))
+	}
+}
+
+func TestAuditUnpinnedResolutionIgnoresPrivateStagingSnapshots(t *testing.T) {
+	client := newAuditEmulatorInterceptedDB(t, auditPassInterceptor)
+	ctx := context.Background()
+	repo := "resolution-repo"
+	publicSnapshot := strings.Repeat("a", 40)
+	stagingSnapshot := "private-staging-snapshot"
+	publicFQN := "example.test/resolution.Visible"
+	stagingOnlyFQN := "example.test/resolution.Private"
+	now := time.Now().UTC()
+	if err := writeSnapshot(ctx, client, repo, publicSnapshot, publicSnapshot, publicSnapshot, now, "main", nil, ingestOpts{kind: "ingested"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSnapshot(ctx, client, repo, stagingSnapshot, stagingSnapshot, strings.Repeat("b", 40), now.Add(time.Hour), "main", nil, ingestOpts{kind: "staging"}, 2); err != nil {
+		t.Fatal(err)
+	}
+	auditInsertMember(t, client, repo, publicSnapshot, "public-id", publicFQN, nil)
+	auditInsertMember(t, client, repo, stagingSnapshot, "staging-id", publicFQN, nil)
+	auditInsertMember(t, client, repo, stagingSnapshot, "staging-only-id", stagingOnlyFQN, nil)
+
+	_, gotRepo, gotSnapshot, err := resolveFQNInRepo(ctx, client, publicFQN, "", "")
+	if err != nil {
+		t.Fatalf("resolve published symbol: %v", err)
+	}
+	if gotRepo != repo || gotSnapshot != publicSnapshot {
+		t.Errorf("unpinned public resolution selected %s@%s, want %s@%s", gotRepo, gotSnapshot, repo, publicSnapshot)
+	}
+	if _, _, _, err := resolveFQNInRepo(ctx, client, stagingOnlyFQN, "", ""); err == nil {
+		t.Fatal("unpinned resolution exposed a symbol that exists only in a private staging snapshot")
+	}
+}
+
+func TestAuditConcurrentBlobRepairCannotDeleteNewlyPublishedIdenticalContent(t *testing.T) {
+	deleteReached := make(chan struct{}, 1)
+	releaseDelete := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseDelete) }) }
+	defer release()
+	var raceEnabled atomic.Bool
+	var deleteCommitted atomic.Bool
+	var failRepairWrite atomic.Bool
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if raceEnabled.Load() && auditCommitDeletesTable(req, "FileContents") {
+			deleteReached <- struct{}{}
+			<-releaseDelete
+			err := invoker(ctx, method, req, reply, cc, opts...)
+			if err == nil {
+				deleteCommitted.Store(true)
+			}
+			return err
+		}
+		if raceEnabled.Load() && failRepairWrite.Load() && deleteCommitted.Load() && auditCommitWritesTable(req, "FileContents") {
+			return status.Error(codes.PermissionDenied, "audit injected repair write failure after stale delete")
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+	client := newAuditEmulatorInterceptedDB(t, interceptor)
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte("shared-content-"), fileChunkSize/15+2)
+	sha := sha256Hex(string(payload))
+	repo := newTrackedTestRepo(t, map[string]string{"payload.txt": string(payload)})
+	auditInsertSnapshot(t, client, "published-repo", "published-snapshot")
+	auditInsertSnapshot(t, client, "repair-repo", "repair-snapshot")
+	applyTestMutations(t, client, spanner.InsertOrUpdate("FileContents",
+		[]string{"content_sha", "chunk_index", "bytes", "created_at"},
+		[]any{sha, int64(0), payload[:fileChunkSize], spanner.CommitTimestamp}))
+
+	racerDone := make(chan error, 1)
+	raceEnabled.Store(true)
+	go func() {
+		racerDone <- captureFiles(ctx, client, repo, "repair-repo", "repair-snapshot", auditNoProgress)
+	}()
+	select {
+	case <-deleteReached:
+	case err := <-racerDone:
+		t.Fatalf("repair writer exited before the delete barrier: %v", err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("repair writer did not reach the delete barrier")
+	}
+	var complete []*spanner.Mutation
+	for index, offset := int64(0), 0; offset < len(payload); index, offset = index+1, offset+fileChunkSize {
+		end := offset + fileChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		complete = append(complete, spanner.InsertOrUpdate("FileContents",
+			[]string{"content_sha", "chunk_index", "bytes", "created_at"},
+			[]any{sha, index, payload[offset:end], spanner.CommitTimestamp}))
+	}
+	complete = append(complete, spanner.InsertOrUpdate("SnapshotFiles",
+		[]string{"repo", "snapshot_id", "file_path", "content_sha", "is_go", "file_order"},
+		[]any{"published-repo", "published-snapshot", "payload.txt", sha, false, int64(0)}))
+	if _, err := client.Apply(ctx, complete); err != nil {
+		t.Fatalf("publish complete identical content while repair is paused: %v", err)
+	}
+	failRepairWrite.Store(true)
+	release()
+	var repairErr error
+	select {
+	case repairErr = <-racerDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("repair writer did not return after the delete barrier was released")
+	}
+	if repairErr == nil {
+		t.Fatal("repair writer succeeded despite injected post-delete write failure")
+	}
+	raceEnabled.Store(false)
+	files, err := loadSnapshotFiles(ctx, client, "published-repo", "published-snapshot")
+	if err != nil {
+		t.Fatalf("failed repair corrupted another writer's published content: %v", err)
+	}
+	if got := auditFile(t, files, "payload.txt"); !bytes.Equal(got, payload) {
+		t.Fatalf("published identical content changed after concurrent repair: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+func TestAuditLargeSnapshotPublicationIsBoundedAndAtomicallyVisible(t *testing.T) {
+	const memberCount = 80001
+	const mutationLimit = 80000
+	repo := "large-publication-repo"
+	publicSnapshot := strings.Repeat("c", 40)
+	stagingSnapshot := "large-private-staging"
+	var client *spanner.Client
+	var publishing atomic.Bool
+	var maxMutations atomic.Int64
+	var observedMu sync.Mutex
+	var observedCounts []int64
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		commit, isCommit := req.(*spannerpb.CommitRequest)
+		if !publishing.Load() || !isCommit {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+		count := int64(len(commit.GetMutations()))
+		for {
+			previous := maxMutations.Load()
+			if count <= previous || maxMutations.CompareAndSwap(previous, count) {
+				break
+			}
+		}
+		if count > mutationLimit {
+			return status.Errorf(codes.ResourceExhausted, "audit commit has %d mutations, limit %d", count, mutationLimit)
+		}
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		if err == nil {
+			visible := auditSnapshotMemberCount(t, client, repo, publicSnapshot)
+			observedMu.Lock()
+			observedCounts = append(observedCounts, visible)
+			observedMu.Unlock()
+		}
+		return err
+	}
+	client = newAuditEmulatorInterceptedDB(t, interceptor)
+	ctx := context.Background()
+	auditInsertSnapshot(t, client, repo, publicSnapshot)
+	auditInsertMember(t, client, repo, publicSnapshot, "old-id", "example.test/large.Old", nil)
+	if err := writeSnapshot(ctx, client, repo, stagingSnapshot, stagingSnapshot, strings.Repeat("d", 40), time.Now(), "main", nil, ingestOpts{kind: "staging"}, memberCount); err != nil {
+		t.Fatal(err)
+	}
+	members := make([]Symbol, memberCount)
+	for i := range members {
+		members[i] = Symbol{
+			ID:         fmt.Sprintf("large-%05d", i),
+			FQN:        fmt.Sprintf("example.test/large.Symbol%05d", i),
+			Kind:       "func",
+			FilePath:   "large.go",
+			LineStart:  i + 1,
+			LineEnd:    i + 1,
+			Repo:       repo,
+			SnapshotID: stagingSnapshot,
+		}
+	}
+	if err := writeSnapshotMembers(ctx, client, members, auditNoProgress); err != nil {
+		t.Fatalf("seed large staged snapshot: %v", err)
+	}
+
+	publishing.Store(true)
+	err := publishStagedSnapshot(ctx, client, repo, stagingSnapshot, publicSnapshot, "ingested")
+	publishing.Store(false)
+	if err != nil {
+		t.Errorf("bounded large snapshot publication failed: %v", err)
+	}
+	if got := maxMutations.Load(); got > mutationLimit {
+		t.Errorf("publication sent %d mutations in one commit, limit is %d", got, mutationLimit)
+	}
+	observedMu.Lock()
+	for _, count := range observedCounts {
+		if count != 1 && count != memberCount {
+			t.Errorf("public snapshot exposed partial graph with %d/%d members", count, memberCount)
+		}
+	}
+	observedMu.Unlock()
+	if err == nil {
+		if got := auditSnapshotMemberCount(t, client, repo, publicSnapshot); got != memberCount {
+			t.Errorf("published member count = %d, want %d", got, memberCount)
+		}
+	} else if got := auditSnapshotMemberCount(t, client, repo, publicSnapshot); got != 1 {
+		t.Errorf("failed publication changed prior public snapshot to %d members, want 1", got)
+	}
+}
+
+func TestAuditC4ZeroEdgeReingestClearsStaleVersionEdges(t *testing.T) {
+	client := newAuditEmulatorInterceptedDB(t, auditPassInterceptor)
+	auditInstallEmbeddings(t)
+	repoPath := newTrackedTestRepo(t, map[string]string{
+		"go.mod":  "module example.test/leaf\n\ngo 1.27\n",
+		"leaf.go": "package leaf\n\nfunc Leaf() int { return 1 }\n",
+	})
+	ctx := context.Background()
+	stats, err := doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	symbolID := uuidFromFQN("example.test/leaf.Leaf")
+	var contentHash string
+	iter := client.Single().Query(ctx, spanner.Statement{
+		SQL:    "SELECT content_hash FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap AND symbol_id=@sid",
+		Params: map[string]any{"repo": stats.Repo, "snap": stats.SnapshotID, "sid": symbolID},
+	})
+	row, err := iter.Next()
+	iter.Stop()
+	if err != nil || row.Columns(&contentHash) != nil {
+		t.Fatalf("load leaf version hash: %v", err)
+	}
+	staleID := uuidFromFQN("example.test/leaf.Stale")
+	if err := writeSymbolEdges(ctx, client, []Edge{{Repo: stats.Repo, SnapshotID: stats.SnapshotID, SrcID: symbolID, SrcContentHash: contentHash, DstID: staleID, Kind: "CALLS"}}, auditNoProgress); err != nil {
+		t.Fatal(err)
+	}
+	before, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, edge := range before {
+		if edge.Src == symbolID && edge.Dst == staleID && edge.Kind == "CALLS" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("fixture did not establish a visible stale edge")
+	}
+	if _, err := doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress); err != nil {
+		t.Fatal(err)
+	}
+	after, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range after {
+		if edge.Src == symbolID && edge.Dst == staleID && edge.Kind == "CALLS" {
+			t.Fatalf("zero-edge reingest retained a visible stale edge: %+v", edge)
+		}
+	}
+}
+
+func TestAuditTrackedFileThroughParentSymlinkIsRejectedBeforeEmbedding(t *testing.T) {
+	client := newAuditEmulatorInterceptedDB(t, auditPassInterceptor)
+	repo := newTrackedTestRepo(t, map[string]string{
+		"go.mod":        "module example.test/parentlink\n\ngo 1.27\n",
+		"dir/source.go": "package dir\n\nfunc Local() string { return \"local\" }\n",
+	})
+	external := t.TempDir()
+	marker := "AUDIT_EXTERNAL_PARENT_SYMLINK_SECRET"
+	if err := os.WriteFile(filepath.Join(external, "source.go"), []byte("package dir\n\nfunc External() string { return \""+marker+"\" }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(repo, "dir")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(repo, "dir")); err != nil {
+		t.Fatal(err)
+	}
+	previousRequest := requestEmbeddings
+	var exposed atomic.Bool
+	requestEmbeddings = func(_ context.Context, texts []string, _ string) ([][]float32, error) {
+		vectors := make([][]float32, len(texts))
+		for i, text := range texts {
+			if strings.Contains(text, marker) {
+				exposed.Store(true)
+			}
+			vectors[i] = []float32{1, float32(i + 1)}
+		}
+		return vectors, nil
+	}
+	t.Cleanup(func() { requestEmbeddings = previousRequest })
+	_, err := doIngest(context.Background(), client, repo, ingestOpts{}, auditNoProgress)
+	if exposed.Load() {
+		t.Fatal("tracked file reached through a parent symlink was sent to the embedding boundary")
+	}
+	if auditDatabaseContainsMarker(t, client, []byte(marker)) {
+		t.Fatal("tracked file reached through a parent symlink was persisted from outside the checkout")
+	}
+	if err == nil {
+		t.Fatal("ingest accepted a tracked file reached through a parent symlink outside the checkout")
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "symlink") && !strings.Contains(lower, "outside") && !strings.Contains(lower, "escape") {
+		t.Fatalf("parent symlink refusal lacks boundary reason: %v", err)
 	}
 }
