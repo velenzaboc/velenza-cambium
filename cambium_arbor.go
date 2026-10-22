@@ -148,6 +148,7 @@ func inarchHead(repoPath string) (string, error) {
 			if v := strings.TrimSpace(lease[k]); v != "" {
 				return v, nil
 			}
+		}
 	}
 	return "", fmt.Errorf("unable to resolve .inarch HEAD in %s", repoPath)
 }
