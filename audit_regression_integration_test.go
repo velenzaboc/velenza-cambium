@@ -245,6 +245,15 @@ func auditCommitWritesTable(req any, table string) bool {
 		if write := mutation.GetInsertOrUpdate(); write != nil && write.GetTable() == table {
 			return true
 		}
+		if write := mutation.GetInsert(); write != nil && write.GetTable() == table {
+			return true
+		}
+		if write := mutation.GetUpdate(); write != nil && write.GetTable() == table {
+			return true
+		}
+		if write := mutation.GetReplace(); write != nil && write.GetTable() == table {
+			return true
+		}
 	}
 	return false
 }
@@ -262,22 +271,13 @@ func auditCommitDeletesTable(req any, table string) bool {
 	return false
 }
 
-func auditSnapshotMemberCount(t *testing.T, client *spanner.Client, repo, snapshot string) int64 {
+func auditVisibleSnapshotMemberCount(t *testing.T, client *spanner.Client, repo, snapshot string) int64 {
 	t.Helper()
-	iter := client.Single().Query(context.Background(), spanner.Statement{
-		SQL:    "SELECT COUNT(*) FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap",
-		Params: map[string]any{"repo": repo, "snap": snapshot},
-	})
-	defer iter.Stop()
-	row, err := iter.Next()
+	members, err := snapshotMemberMeta(context.Background(), client, repo, snapshot)
 	if err != nil {
-		t.Fatalf("count snapshot members: %v", err)
+		t.Fatalf("read visible snapshot members: %v", err)
 	}
-	var count int64
-	if err := row.Columns(&count); err != nil {
-		t.Fatalf("decode snapshot member count: %v", err)
-	}
-	return count
+	return int64(len(members))
 }
 
 func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *testing.T) {
@@ -391,26 +391,26 @@ func TestAuditUnpinnedResolutionIgnoresPrivateStagingSnapshots(t *testing.T) {
 }
 
 func TestAuditConcurrentBlobRepairCannotDeleteNewlyPublishedIdenticalContent(t *testing.T) {
-	deleteReached := make(chan struct{}, 1)
-	releaseDelete := make(chan struct{})
+	type writerContextKeyType struct{}
+	writerContextKey := writerContextKeyType{}
+	mutationReached := make(chan struct{}, 1)
+	releaseMutation := make(chan struct{})
 	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(releaseDelete) }) }
+	release := func() { releaseOnce.Do(func() { close(releaseMutation) }) }
 	defer release()
 	var raceEnabled atomic.Bool
-	var deleteCommitted atomic.Bool
-	var failRepairWrite atomic.Bool
+	var writerPaused atomic.Bool
+	var failWriterMutation atomic.Bool
 	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		if raceEnabled.Load() && auditCommitDeletesTable(req, "FileContents") {
-			deleteReached <- struct{}{}
-			<-releaseDelete
-			err := invoker(ctx, method, req, reply, cc, opts...)
-			if err == nil {
-				deleteCommitted.Store(true)
+		markedWriter, _ := ctx.Value(writerContextKey).(bool)
+		if raceEnabled.Load() && markedWriter && (auditCommitDeletesTable(req, "FileContents") || auditCommitWritesTable(req, "FileContents")) {
+			if writerPaused.CompareAndSwap(false, true) {
+				mutationReached <- struct{}{}
+				<-releaseMutation
 			}
-			return err
-		}
-		if raceEnabled.Load() && failRepairWrite.Load() && deleteCommitted.Load() && auditCommitWritesTable(req, "FileContents") {
-			return status.Error(codes.PermissionDenied, "audit injected repair write failure after stale delete")
+			if failWriterMutation.Load() && auditCommitWritesTable(req, "FileContents") {
+				return status.Error(codes.PermissionDenied, "audit injected marked-writer content failure")
+			}
 		}
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
@@ -427,15 +427,16 @@ func TestAuditConcurrentBlobRepairCannotDeleteNewlyPublishedIdenticalContent(t *
 
 	racerDone := make(chan error, 1)
 	raceEnabled.Store(true)
+	writerCtx := context.WithValue(ctx, writerContextKey, true)
 	go func() {
-		racerDone <- captureFiles(ctx, client, repo, "repair-repo", "repair-snapshot", auditNoProgress)
+		racerDone <- captureFiles(writerCtx, client, repo, "repair-repo", "repair-snapshot", auditNoProgress)
 	}()
 	select {
-	case <-deleteReached:
+	case <-mutationReached:
 	case err := <-racerDone:
-		t.Fatalf("repair writer exited before the delete barrier: %v", err)
+		t.Fatalf("repair writer exited before the content-mutation barrier: %v", err)
 	case <-time.After(15 * time.Second):
-		t.Fatal("repair writer did not reach the delete barrier")
+		t.Fatal("repair writer did not reach the content-mutation barrier")
 	}
 	var complete []*spanner.Mutation
 	for index, offset := int64(0), 0; offset < len(payload); index, offset = index+1, offset+fileChunkSize {
@@ -453,16 +454,16 @@ func TestAuditConcurrentBlobRepairCannotDeleteNewlyPublishedIdenticalContent(t *
 	if _, err := client.Apply(ctx, complete); err != nil {
 		t.Fatalf("publish complete identical content while repair is paused: %v", err)
 	}
-	failRepairWrite.Store(true)
+	failWriterMutation.Store(true)
 	release()
 	var repairErr error
 	select {
 	case repairErr = <-racerDone:
 	case <-time.After(15 * time.Second):
-		t.Fatal("repair writer did not return after the delete barrier was released")
+		t.Fatal("repair writer did not return after the content-mutation barrier was released")
 	}
 	if repairErr == nil {
-		t.Fatal("repair writer succeeded despite injected post-delete write failure")
+		t.Fatal("repair writer succeeded despite injected content-mutation failure")
 	}
 	raceEnabled.Store(false)
 	files, err := loadSnapshotFiles(ctx, client, "published-repo", "published-snapshot")
@@ -502,7 +503,7 @@ func TestAuditLargeSnapshotPublicationIsBoundedAndAtomicallyVisible(t *testing.T
 		}
 		err := invoker(ctx, method, req, reply, cc, opts...)
 		if err == nil {
-			visible := auditSnapshotMemberCount(t, client, repo, publicSnapshot)
+			visible := auditVisibleSnapshotMemberCount(t, client, repo, publicSnapshot)
 			observedMu.Lock()
 			observedCounts = append(observedCounts, visible)
 			observedMu.Unlock()
@@ -550,10 +551,10 @@ func TestAuditLargeSnapshotPublicationIsBoundedAndAtomicallyVisible(t *testing.T
 	}
 	observedMu.Unlock()
 	if err == nil {
-		if got := auditSnapshotMemberCount(t, client, repo, publicSnapshot); got != memberCount {
+		if got := auditVisibleSnapshotMemberCount(t, client, repo, publicSnapshot); got != memberCount {
 			t.Errorf("published member count = %d, want %d", got, memberCount)
 		}
-	} else if got := auditSnapshotMemberCount(t, client, repo, publicSnapshot); got != 1 {
+	} else if got := auditVisibleSnapshotMemberCount(t, client, repo, publicSnapshot); got != 1 {
 		t.Errorf("failed publication changed prior public snapshot to %d members, want 1", got)
 	}
 }
