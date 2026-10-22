@@ -211,43 +211,25 @@ func callerSets(ctx context.Context, sp *spanner.Client, repo, snapshotID string
 	if len(targets) == 0 {
 		return out, nil
 	}
-	const chunk = 1000
-	for start := 0; start < len(targets); start += chunk {
-		end := start + chunk
-		if end > len(targets) {
-			end = len(targets)
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		targetSet[target] = struct{}{}
+	}
+	edges, err := loadSnapshotEdges(ctx, sp, repo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	for _, edge := range edges {
+		if edge.Kind != "CALLS" && edge.Kind != "REFERENCES" {
+			continue
 		}
-		stmt := spanner.Statement{
-			SQL: `SELECT e.dst_symbol_id, e.src_symbol_id
-			      FROM SymbolEdges AS e
-			      JOIN SnapshotMembers AS sm
-			        ON sm.symbol_id = e.src_symbol_id AND sm.content_hash = e.src_content_hash
-			      WHERE sm.repo = @repo AND sm.snapshot_id = @snap
-			        AND e.kind IN ('CALLS', 'REFERENCES')
-			        AND e.dst_symbol_id IN UNNEST(@targets)`,
-			Params: map[string]interface{}{"repo": repo, "snap": snapshotID, "targets": targets[start:end]},
+		if _, ok := targetSet[edge.Dst]; !ok {
+			continue
 		}
-		iter := sp.Single().Query(ctx, stmt)
-		for {
-			row, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				iter.Stop()
-				return nil, err
-			}
-			var dst, src string
-			if err := row.Columns(&dst, &src); err != nil {
-				iter.Stop()
-				return nil, err
-			}
-			if out[dst] == nil {
-				out[dst] = map[string]struct{}{}
-			}
-			out[dst][src] = struct{}{}
+		if out[edge.Dst] == nil {
+			out[edge.Dst] = map[string]struct{}{}
 		}
-		iter.Stop()
+		out[edge.Dst][edge.Src] = struct{}{}
 	}
 	return out, nil
 }

@@ -119,6 +119,14 @@ func captureFiles(ctx context.Context, sp *spanner.Client, repoPath, repoName, s
 		}
 		seen[f.sha] = struct{}{}
 		newContent++
+		// A prior interrupted writer may have left only a prefix. Remove that
+		// invalid object before reconstructing the complete content-addressed
+		// blob; valid hashes were excluded by selectPresentShas above.
+		if _, err := sp.Apply(ctx, []*spanner.Mutation{
+			spanner.Delete("FileContents", spanner.Key{f.sha}.AsPrefix()),
+		}); err != nil {
+			return err
+		}
 		for ci, off := 0, 0; off < len(f.bytes) || ci == 0; ci, off = ci+1, off+fileChunkSize {
 			end := off + fileChunkSize
 			if end > len(f.bytes) {
@@ -164,9 +172,9 @@ func captureFiles(ctx context.Context, sp *spanner.Client, repoPath, repoName, s
 	return nil
 }
 
-// selectPresentShas returns which content_shas already have content stored.
-// Chunks of a sha are always written together, so chunk 0's presence implies
-// the whole file is present.
+// selectPresentShas returns only complete content-addressed blobs. An
+// interrupted multi-commit writer can leave chunk zero behind, so presence is
+// established by contiguous indices plus a full reconstructed hash.
 func selectPresentShas(ctx context.Context, sp *spanner.Client, shaSet map[string]struct{}) (map[string]struct{}, error) {
 	shas := make([]string, 0, len(shaSet))
 	for s := range shaSet {
@@ -180,25 +188,50 @@ func selectPresentShas(ctx context.Context, sp *spanner.Client, shaSet map[strin
 			end = len(shas)
 		}
 		iter := sp.Single().Query(ctx, spanner.Statement{
-			SQL:    `SELECT content_sha FROM FileContents WHERE chunk_index = 0 AND content_sha IN UNNEST(@shas)`,
+			SQL: `SELECT content_sha, chunk_index, bytes
+			      FROM FileContents WHERE content_sha IN UNNEST(@shas)
+			      ORDER BY content_sha, chunk_index`,
 			Params: map[string]interface{}{"shas": shas[start:end]},
 		})
 		err := func() error {
 			defer iter.Stop()
+			type contentCandidate struct {
+				bytes []byte
+				next  int64
+				valid bool
+			}
+			candidates := map[string]*contentCandidate{}
 			for {
 				row, err := iter.Next()
 				if err == iterator.Done {
-					return nil
+					break
 				}
 				if err != nil {
 					return err
 				}
 				var s string
-				if err := row.Columns(&s); err != nil {
+				var index int64
+				var chunk []byte
+				if err := row.Columns(&s, &index, &chunk); err != nil {
 					return err
 				}
-				present[s] = struct{}{}
+				candidate := candidates[s]
+				if candidate == nil {
+					candidate = &contentCandidate{valid: true}
+					candidates[s] = candidate
+				}
+				if index != candidate.next {
+					candidate.valid = false
+				}
+				candidate.next = index + 1
+				candidate.bytes = append(candidate.bytes, chunk...)
 			}
+			for sha, candidate := range candidates {
+				if candidate.valid && candidate.next > 0 && sha256Hex(string(candidate.bytes)) == sha {
+					present[sha] = struct{}{}
+				}
+			}
+			return nil
 		}()
 		if err != nil {
 			return nil, err
@@ -219,11 +252,10 @@ type snapshotFileRow struct {
 // its chunks, ordered by file_order.
 func loadSnapshotFiles(ctx context.Context, sp *spanner.Client, repo, snapshotID string) ([]snapshotFileRow, error) {
 	stmt := spanner.Statement{
-		SQL: `SELECT sf.file_path, sf.content_sha, sf.is_go, sf.file_order, fc.chunk_index, fc.bytes
+		SQL: `SELECT sf.file_path, sf.content_sha, sf.is_go
 		      FROM SnapshotFiles AS sf
-		      JOIN FileContents AS fc ON fc.content_sha = sf.content_sha
 		      WHERE sf.repo = @repo AND sf.snapshot_id = @snap
-		      ORDER BY sf.file_order, fc.chunk_index`,
+		      ORDER BY sf.file_order`,
 		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
@@ -237,19 +269,50 @@ func loadSnapshotFiles(ctx context.Context, sp *spanner.Client, repo, snapshotID
 		if err != nil {
 			return nil, err
 		}
-		var path, sha string
-		var isGo bool
-		var fileOrder, chunkIndex int64
-		var chunk []byte
-		if err := row.Columns(&path, &sha, &isGo, &fileOrder, &chunkIndex, &chunk); err != nil {
+		var file snapshotFileRow
+		if err := row.Columns(&file.path, &file.sha, &file.isGo); err != nil {
 			return nil, err
 		}
-		// file_order makes a file's chunk rows contiguous; chunk_index orders
-		// them within. Append to the current file, or start a new one.
-		if len(out) > 0 && out[len(out)-1].path == path {
-			out[len(out)-1].bytes = append(out[len(out)-1].bytes, chunk...)
-		} else {
-			out = append(out, snapshotFileRow{path: path, sha: sha, isGo: isGo, bytes: append([]byte(nil), chunk...)})
+		out = append(out, file)
+	}
+	for i := range out {
+		chunkStmt := spanner.Statement{
+			SQL: `SELECT chunk_index, bytes
+			      FROM FileContents
+			      WHERE content_sha = @sha
+			      ORDER BY chunk_index`,
+			Params: map[string]interface{}{"sha": out[i].sha},
+		}
+		chunks := sp.Single().Query(ctx, chunkStmt)
+		var nextChunk int64
+		for {
+			row, err := chunks.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				chunks.Stop()
+				return nil, err
+			}
+			var chunkIndex int64
+			var chunk []byte
+			if err := row.Columns(&chunkIndex, &chunk); err != nil {
+				chunks.Stop()
+				return nil, err
+			}
+			if chunkIndex != nextChunk {
+				chunks.Stop()
+				return nil, fmt.Errorf("snapshot file %q has non-contiguous chunk index %d, want %d", out[i].path, chunkIndex, nextChunk)
+			}
+			out[i].bytes = append(out[i].bytes, chunk...)
+			nextChunk++
+		}
+		chunks.Stop()
+		if nextChunk == 0 {
+			return nil, fmt.Errorf("snapshot file %q has no content chunks", out[i].path)
+		}
+		if got := sha256Hex(string(out[i].bytes)); got != out[i].sha {
+			return nil, fmt.Errorf("snapshot file %q content hash mismatch: got %s want %s", out[i].path, got, out[i].sha)
 		}
 	}
 	return out, nil

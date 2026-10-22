@@ -80,9 +80,9 @@ CREATE INDEX SnapshotMembersByContentHash
 CREATE INDEX SnapshotMembersBySymbol
   ON SnapshotMembers(symbol_id);
 
--- SnapshotEdges: structural edges only (DECLARES, IMPORTS) — their source is a
--- package or file, which has no content body, so they cannot be version-keyed.
--- Small (~5k/snapshot). Content-sourced edges live in SymbolEdges.
+-- SnapshotEdges: the complete derived edge set for one repository snapshot.
+-- Resolution depends on the whole analysis context, so even an unchanged
+-- source body may have different CALLS/IMPLEMENTS edges in another snapshot.
 CREATE TABLE SnapshotEdges (
   repo          STRING(128) NOT NULL,
   snapshot_id   STRING(64)  NOT NULL,

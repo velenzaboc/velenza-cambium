@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -114,6 +116,18 @@ func inarchDeriveRepoName(repoPath string) (string, error) {
 
 func inarchHead(repoPath string) (string, error) {
 	inarchDir := filepath.Join(repoPath, ".inarch")
+	if head, err := inarchWorkspaceChangeset(repoPath); err == nil && head != "" {
+		return head, nil
+	}
+	// Native Inarch refs contain raw 32-byte hashes and hex-encode ref names.
+	refPath := filepath.Join(inarchDir, "store", "meta", "refs", hex.EncodeToString([]byte("main")))
+	if raw, err := os.ReadFile(refPath); err == nil {
+		if len(raw) != 32 {
+			return "", fmt.Errorf("invalid Inarch main ref length %d", len(raw))
+		}
+		return hex.EncodeToString(raw), nil
+	}
+	// Retain the former HEAD layout as read compatibility for older workspaces.
 	headBytes, err := os.ReadFile(filepath.Join(inarchDir, "HEAD"))
 	if err == nil {
 		headStr := strings.TrimSpace(string(headBytes))
@@ -129,18 +143,48 @@ func inarchHead(repoPath string) (string, error) {
 			return headStr, nil
 		}
 	}
-	leaseBytes, err := os.ReadFile(filepath.Join(inarchDir, "jit_lease.json"))
-	if err == nil {
-		var lease map[string]any
-		if json.Unmarshal(leaseBytes, &lease) == nil {
-			for _, k := range []string{"head_changeset_id", "base_changeset_id", "changeset_id"} {
-				if v, ok := lease[k].(string); ok && strings.TrimSpace(v) != "" {
-					return strings.TrimSpace(v), nil
-				}
+	if lease, err := readSimpleTOML(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
+		for _, k := range []string{"head_changeset_id", "base_changeset_id", "changeset_id"} {
+			if v := strings.TrimSpace(lease[k]); v != "" {
+				return v, nil
 			}
-		}
 	}
 	return "", fmt.Errorf("unable to resolve .inarch HEAD in %s", repoPath)
+}
+
+func inarchWorkspaceChangeset(repoPath string) (string, error) {
+	values, err := readSimpleTOML(filepath.Join(repoPath, ".inarch", "workspace_state.toml"))
+	if err != nil {
+		return "", err
+	}
+	head := strings.TrimSpace(values["changeset_id"])
+	if len(head) != 64 {
+		return "", fmt.Errorf("invalid Inarch workspace changeset_id %q", head)
+	}
+	if _, err := hex.DecodeString(head); err != nil {
+		return "", fmt.Errorf("invalid Inarch workspace changeset_id: %w", err)
+	}
+	return strings.ToLower(head), nil
+}
+
+func readSimpleTOML(path string) (map[string]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return out, nil
 }
 
 func inarchBranch(repoPath string) string {
@@ -156,21 +200,24 @@ func inarchBranch(repoPath string) string {
 			}
 		}
 	}
-	if leaseBytes, err := os.ReadFile(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
-		var lease map[string]any
-		if json.Unmarshal(leaseBytes, &lease) == nil {
-			for _, k := range []string{"bookmark", "branch"} {
-				if v, ok := lease[k].(string); ok && strings.TrimSpace(v) != "" {
-					return strings.TrimSpace(v)
-				}
+	if lease, err := readSimpleTOML(filepath.Join(inarchDir, "jit_lease.json")); err == nil {
+		for _, k := range []string{"bookmark", "branch"} {
+			if v := strings.TrimSpace(lease[k]); v != "" {
+				return v
 			}
 		}
 	}
 	return "main"
 }
 
-func inarchCommitTime(repoPath, _ string) (time.Time, error) {
+func inarchCommitTime(repoPath, sha string) (time.Time, error) {
 	inarchDir := filepath.Join(repoPath, ".inarch")
+	if info, err := os.Stat(inarchChangesetPath(repoPath, sha)); err == nil {
+		return info.ModTime().UTC(), nil
+	}
+	if info, err := os.Stat(filepath.Join(inarchDir, "workspace_state.toml")); err == nil {
+		return info.ModTime().UTC(), nil
+	}
 	if info, err := os.Stat(filepath.Join(inarchDir, "HEAD")); err == nil {
 		return info.ModTime().UTC(), nil
 	}
@@ -181,6 +228,26 @@ func inarchCommitTime(repoPath, _ string) (time.Time, error) {
 }
 
 func inarchParents(repoPath, sha string) ([]string, error) {
+	raw, err := os.ReadFile(inarchChangesetPath(repoPath, sha))
+	if err == nil {
+		if len(raw) < 12 || string(raw[:8]) != "INRCBCS1" {
+			return nil, fmt.Errorf("invalid Inarch changeset header for %s", sha)
+		}
+		count := int(binary.LittleEndian.Uint32(raw[8:12]))
+		if count > (len(raw)-12)/32 {
+			return nil, fmt.Errorf("truncated Inarch changeset parent list for %s", sha)
+		}
+		parents := make([]string, count)
+		for i := 0; i < count; i++ {
+			start := 12 + i*32
+			parents[i] = hex.EncodeToString(raw[start : start+32])
+		}
+		return parents, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	// Read compatibility for the former JSON metadata layout.
 	metaPath := filepath.Join(repoPath, ".inarch", "commits", sha+".json")
 	if raw, err := os.ReadFile(metaPath); err == nil {
 		var meta struct {
@@ -191,6 +258,54 @@ func inarchParents(repoPath, sha string) ([]string, error) {
 		}
 	}
 	return []string{}, nil
+}
+
+func inarchChangesetPath(repoPath, sha string) string {
+	if len(sha) < 2 {
+		return filepath.Join(repoPath, ".inarch", "store", "meta", "changesets", sha)
+	}
+	return filepath.Join(repoPath, ".inarch", "store", "meta", "changesets", sha[:2], sha)
+}
+
+// validateTrackedFileBoundaries refuses tracked symlinks that leave the
+// checkout before any parser, embedder, or fidelity reader can dereference
+// them. Symlinks whose resolved target remains inside the checkout are valid.
+func validateTrackedFileBoundaries(repoPath string) error {
+	paths, err := listTrackedFiles(repoPath)
+	if err != nil {
+		return err
+	}
+	root, err := filepath.EvalSymlinks(repoPath)
+	if err != nil {
+		return err
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	for _, rel := range paths {
+		full := filepath.Join(repoPath, filepath.FromSlash(rel))
+		info, err := os.Lstat(full)
+		if err != nil {
+			return fmt.Errorf("tracked file %q: %w", rel, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(full)
+		if err != nil {
+			return fmt.Errorf("tracked symlink %q: %w", rel, err)
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return fmt.Errorf("tracked symlink %q: %w", rel, err)
+		}
+		within, err := filepath.Rel(root, resolved)
+		if err != nil || within == ".." || strings.HasPrefix(within, ".."+string(filepath.Separator)) || filepath.IsAbs(within) {
+			return fmt.Errorf("tracked symlink %q escapes repository checkout", rel)
+		}
+	}
+	return nil
 }
 
 func listTrackedFiles(repoPath string) ([]string, error) {

@@ -82,7 +82,7 @@ func repoSuffix(repo string) string {
 // snapshotRepo returns the repo a snapshot id belongs to.
 func snapshotRepo(ctx context.Context, sp *spanner.Client, snapshotID string) (string, error) {
 	iter := sp.Single().Query(ctx, spanner.Statement{
-		SQL:    `SELECT repo FROM Snapshots WHERE snapshot_id = @snap LIMIT 1`,
+		SQL:    `SELECT repo FROM Snapshots WHERE snapshot_id = @snap AND kind != 'staging' ORDER BY repo`,
 		Params: map[string]interface{}{"snap": snapshotID},
 	})
 	defer iter.Stop()
@@ -95,6 +95,11 @@ func snapshotRepo(ctx context.Context, sp *spanner.Client, snapshotID string) (s
 	}
 	var repo string
 	if err := row.Columns(&repo); err != nil {
+		return "", err
+	}
+	if _, err := iter.Next(); err == nil {
+		return "", fmt.Errorf("snapshot %q is ambiguous across repositories; pin it with `use <repo> <snapshot>`", snapshotID)
+	} else if err != iterator.Done {
 		return "", err
 	}
 	return repo, nil

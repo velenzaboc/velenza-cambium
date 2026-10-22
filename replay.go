@@ -20,9 +20,9 @@ import (
 
 // Phase: filtered history backfill. replay walks a repo's commit DAG across all
 // branches and ingests a filtered subset of commits as snapshots. The
-// content-hash caches (SymbolBlobs for embeddings, SymbolEdges for edges) make
-// every commit after the first cheap — only genuinely new symbol-versions cost
-// anything. Commits that touch no .go file are skipped by default, since they
+// content-hash cache for SymbolBlobs makes every commit after the first cheaper;
+// graph edges remain snapshot-scoped because resolution uses the whole program.
+// Commits that touch no .go file are skipped by default, since they
 // produce a snapshot indistinguishable from their parent.
 
 // perIngestGB is the conservative peak RAM of one ingest (packages.Load + CHA
@@ -151,13 +151,23 @@ func cmdReplay(ctx context.Context, args []string) error {
 			out, err := exec.Command("git", "-C", repoPath, "worktree", "add", "--detach", wt, selected[0]).CombinedOutput()
 			wtMu.Unlock()
 			if err != nil {
+				atomic.AddInt64(&failed, 1)
+				wtMu.Lock()
+				_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", wt).Run()
+				wtMu.Unlock()
+				_ = os.RemoveAll(wt)
 				fmt.Printf("  worker %d: worktree add failed: %s\n", workerID, strings.TrimSpace(string(out)))
 				return
 			}
 			defer func() {
 				wtMu.Lock()
-				_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", wt).Run()
+				removeErr := exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", wt).Run()
 				wtMu.Unlock()
+				pathErr := os.RemoveAll(wt)
+				if removeErr != nil || pathErr != nil {
+					atomic.AddInt64(&failed, 1)
+					fmt.Printf("  worker %d: worktree cleanup failed: git=%v path=%v\n", workerID, removeErr, pathErr)
+				}
 			}()
 
 			for idx := range jobs {
@@ -198,6 +208,9 @@ func cmdReplay(ctx context.Context, args []string) error {
 	}
 	wg.Wait()
 	fmt.Printf("replay done: %d ingested, %d already present, %d failed\n", ingested, skipped, failed)
+	if failed > 0 {
+		return fmt.Errorf("replay completed with %d failed operation(s)", failed)
+	}
 	return nil
 }
 
@@ -315,6 +328,9 @@ func cmdUpdate(ctx context.Context, args []string) error {
 			i+1, len(missing), shortSHA(sha), stats.Symbols, stats.Edges)
 	}
 	fmt.Printf("update done: %d ingested, %d failed\n", ingested, failed)
+	if failed > 0 {
+		return fmt.Errorf("update completed with %d failed operation(s)", failed)
+	}
 	return nil
 }
 

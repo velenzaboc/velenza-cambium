@@ -445,14 +445,24 @@ func doSearch(ctx context.Context, sp *spanner.Client, query, repo, snapshotID s
 // non-empty the symbol is resolved within exactly that snapshot; otherwise the
 // most-recently-committed snapshot containing it is used.
 func resolveFQN(ctx context.Context, sp *spanner.Client, fqn, pinSnap string) (symbolID, repo, snapshotID string, err error) {
+	return resolveFQNInRepo(ctx, sp, fqn, "", pinSnap)
+}
+
+func resolveFQNInRepo(ctx context.Context, sp *spanner.Client, fqn, pinRepo, pinSnap string) (symbolID, repo, snapshotID string, err error) {
 	var stmt spanner.Statement
 	if pinSnap != "" {
+		repoClause := ""
+		params := map[string]interface{}{"fqn": fqn, "snap": pinSnap}
+		if pinRepo != "" {
+			repoClause = " AND repo = @repo"
+			params["repo"] = pinRepo
+		}
 		stmt = spanner.Statement{
 			SQL: `SELECT symbol_id, repo, snapshot_id
 			      FROM SnapshotMembers
-			      WHERE fqn = @fqn AND snapshot_id = @snap
-			      LIMIT 1`,
-			Params: map[string]interface{}{"fqn": fqn, "snap": pinSnap},
+			      WHERE fqn = @fqn AND snapshot_id = @snap` + repoClause + `
+			      ORDER BY repo`,
+			Params: params,
 		}
 	} else {
 		stmt = spanner.Statement{
@@ -460,8 +470,7 @@ func resolveFQN(ctx context.Context, sp *spanner.Client, fqn, pinSnap string) (s
 			      FROM SnapshotMembers AS sm
 			      JOIN Snapshots AS s ON s.repo = sm.repo AND s.snapshot_id = sm.snapshot_id
 			      WHERE sm.fqn = @fqn
-			      ORDER BY s.commit_time DESC
-			      LIMIT 1`,
+			      ORDER BY s.commit_time DESC`,
 			Params: map[string]interface{}{"fqn": fqn},
 		}
 	}
@@ -480,6 +489,30 @@ func resolveFQN(ctx context.Context, sp *spanner.Client, fqn, pinSnap string) (s
 	if err := row.Columns(&symbolID, &repo, &snapshotID); err != nil {
 		return "", "", "", err
 	}
+	if pinSnap != "" && pinRepo == "" {
+		if _, nextErr := iter.Next(); nextErr == nil {
+			return "", "", "", fmt.Errorf("symbol %q in snapshot %q is ambiguous across repositories", fqn, pinSnap)
+		} else if nextErr != iterator.Done {
+			return "", "", "", nextErr
+		}
+	} else if pinSnap == "" && pinRepo == "" {
+		for {
+			next, nextErr := iter.Next()
+			if nextErr == iterator.Done {
+				break
+			}
+			if nextErr != nil {
+				return "", "", "", nextErr
+			}
+			var nextSymbolID, nextRepo, nextSnapshot string
+			if err := next.Columns(&nextSymbolID, &nextRepo, &nextSnapshot); err != nil {
+				return "", "", "", err
+			}
+			if nextRepo != repo {
+				return "", "", "", fmt.Errorf("symbol %q is ambiguous across repositories; pin a repository context", fqn)
+			}
+		}
+	}
 	return symbolID, repo, snapshotID, nil
 }
 
@@ -492,22 +525,20 @@ type EdgeRow struct {
 	Kind string
 }
 
-// loadSnapshotEdges returns every edge of a snapshot, unioning the two stores:
-// content-sourced edges (SymbolEdges, version-keyed — joined to the snapshot's
-// members) and structural edges (SnapshotEdges, snapshot-scoped).
+// loadSnapshotEdges returns every edge of a snapshot. New ingests carry an
+// EDGE_SET_COMPLETE marker and keep all derived edges in SnapshotEdges because
+// whole-program resolution is snapshot-dependent. Snapshots written before
+// that marker retain read compatibility with legacy SymbolEdges.
 func loadSnapshotEdges(ctx context.Context, sp *spanner.Client, repo, snapshotID string) ([]EdgeRow, error) {
 	var out []EdgeRow
-	// Content-sourced: a SymbolEdge belongs to this snapshot iff the snapshot
-	// has a member at exactly that source symbol-version.
-	contentStmt := spanner.Statement{
-		SQL: `SELECT e.src_symbol_id, e.dst_symbol_id, e.kind
-		      FROM SymbolEdges AS e
-		      JOIN SnapshotMembers AS sm
-		        ON sm.symbol_id = e.src_symbol_id AND sm.content_hash = e.src_content_hash
-		      WHERE sm.repo = @repo AND sm.snapshot_id = @snap`,
+	complete := false
+	stmt := spanner.Statement{
+		SQL: `SELECT symbol_id, dst_symbol_id, kind
+		      FROM SnapshotEdges
+		      WHERE repo = @repo AND snapshot_id = @snap`,
 		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
 	}
-	iter := sp.Single().Query(ctx, contentStmt)
+	iter := sp.Single().Query(ctx, stmt)
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
@@ -522,17 +553,25 @@ func loadSnapshotEdges(ctx context.Context, sp *spanner.Client, repo, snapshotID
 			iter.Stop()
 			return nil, err
 		}
+		if e.Kind == snapshotEdgeSetMarkerKind && e.Src == snapshotEdgeSetMarkerID && e.Dst == snapshotEdgeSetMarkerID {
+			complete = true
+			continue
+		}
 		out = append(out, e)
 	}
 	iter.Stop()
-	// Structural.
-	structStmt := spanner.Statement{
-		SQL: `SELECT symbol_id, dst_symbol_id, kind
-		      FROM SnapshotEdges
-		      WHERE repo = @repo AND snapshot_id = @snap`,
+	if complete {
+		return out, nil
+	}
+	legacyStmt := spanner.Statement{
+		SQL: `SELECT e.src_symbol_id, e.dst_symbol_id, e.kind
+		      FROM SymbolEdges AS e
+		      JOIN SnapshotMembers AS sm
+		        ON sm.symbol_id = e.src_symbol_id AND sm.content_hash = e.src_content_hash
+		      WHERE sm.repo = @repo AND sm.snapshot_id = @snap`,
 		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
 	}
-	iter = sp.Single().Query(ctx, structStmt)
+	iter = sp.Single().Query(ctx, legacyStmt)
 	defer iter.Stop()
 	for {
 		row, err := iter.Next()
@@ -582,13 +621,17 @@ func snapshotMemberMeta(ctx context.Context, sp *spanner.Client, repo, snapshotI
 // ---------- neighbors ----------
 
 func doNeighbors(ctx context.Context, sp *spanner.Client, fqn string, depth int, pinSnap string) ([]NeighborResult, error) {
+	return doNeighborsInRepo(ctx, sp, fqn, depth, "", pinSnap)
+}
+
+func doNeighborsInRepo(ctx context.Context, sp *spanner.Client, fqn string, depth int, pinRepo, pinSnap string) ([]NeighborResult, error) {
 	if depth <= 0 {
 		depth = 1
 	}
 	if depth > 3 {
 		depth = 3 // guard against runaway fanout
 	}
-	rootID, repo, snapshotID, err := resolveFQN(ctx, sp, fqn, pinSnap)
+	rootID, repo, snapshotID, err := resolveFQNInRepo(ctx, sp, fqn, pinRepo, pinSnap)
 	if err != nil {
 		return nil, err
 	}
@@ -667,42 +710,29 @@ func doNeighbors(ctx context.Context, sp *spanner.Client, fqn string, depth int,
 // doGet returns a symbol's full record. If pinSnap is non-empty the symbol is
 // read AS IT IS in that snapshot; otherwise the most-recent snapshot wins.
 func doGet(ctx context.Context, sp *spanner.Client, fqn, pinSnap string) (*SymbolDetail, error) {
-	var stmt spanner.Statement
-	if pinSnap != "" {
-		stmt = spanner.Statement{
-			SQL: `SELECT sm.fqn, sm.kind, sm.repo, sm.snapshot_id,
-			             sm.file_path, sm.line_start, sm.line_end,
-			             sv.signature, sv.doc_comment, sv.body
-			      FROM SnapshotMembers AS sm
-			      LEFT JOIN SymbolVersions AS sv
-			        ON sv.symbol_id = sm.symbol_id AND sv.content_hash = sm.content_hash
-			      WHERE sm.fqn = @fqn AND sm.snapshot_id = @snap
-			      LIMIT 1`,
-			Params: map[string]interface{}{"fqn": fqn, "snap": pinSnap},
-		}
-	} else {
-		stmt = spanner.Statement{
-			SQL: `SELECT sm.fqn, sm.kind, sm.repo, sm.snapshot_id,
-			             sm.file_path, sm.line_start, sm.line_end,
-			             sv.signature, sv.doc_comment, sv.body
-			      FROM SnapshotMembers AS sm
-			      JOIN Snapshots AS s ON s.repo = sm.repo AND s.snapshot_id = sm.snapshot_id
-			      LEFT JOIN SymbolVersions AS sv
-			        ON sv.symbol_id = sm.symbol_id AND sv.content_hash = sm.content_hash
-			      WHERE sm.fqn = @fqn
-			      ORDER BY s.commit_time DESC
-			      LIMIT 1`,
-			Params: map[string]interface{}{"fqn": fqn},
-		}
+	return doGetInRepo(ctx, sp, fqn, "", pinSnap)
+}
+
+func doGetInRepo(ctx context.Context, sp *spanner.Client, fqn, pinRepo, pinSnap string) (*SymbolDetail, error) {
+	symbolID, repo, snapshotID, err := resolveFQNInRepo(ctx, sp, fqn, pinRepo, pinSnap)
+	if err != nil {
+		return nil, err
+	}
+	stmt := spanner.Statement{
+		SQL: `SELECT sm.fqn, sm.kind, sm.repo, sm.snapshot_id,
+		             sm.file_path, sm.line_start, sm.line_end,
+		             sv.signature, sv.doc_comment, sv.body
+		      FROM SnapshotMembers AS sm
+		      LEFT JOIN SymbolVersions AS sv
+		        ON sv.symbol_id = sm.symbol_id AND sv.content_hash = sm.content_hash
+		      WHERE sm.repo = @repo AND sm.snapshot_id = @snap AND sm.symbol_id = @symbol`,
+		Params: map[string]interface{}{"repo": repo, "snap": snapshotID, "symbol": symbolID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
 	defer iter.Stop()
 	row, err := iter.Next()
 	if err == iterator.Done {
-		if pinSnap != "" {
-			return nil, fmt.Errorf("no symbol %q in snapshot %q", fqn, pinSnap)
-		}
-		return nil, fmt.Errorf("no symbol matches FQN %q — try code_graph_search first", fqn)
+		return nil, fmt.Errorf("resolved symbol %q disappeared from %s@%s", fqn, repo, snapshotID)
 	}
 	if err != nil {
 		return nil, err
@@ -742,6 +772,7 @@ func doListCommits(ctx context.Context, sp *spanner.Client) ([]CommitInfo, error
 	stmt := spanner.Statement{
 		SQL: `SELECT repo, snapshot_id, commit_sha, kind, branch, symbol_count, commit_time, ingested_at
 		      FROM Snapshots
+		      WHERE kind != 'staging'
 		      ORDER BY ingested_at DESC`,
 	}
 	iter := sp.Single().Query(ctx, stmt)
@@ -779,7 +810,7 @@ func doListCommits(ctx context.Context, sp *spanner.Client) ([]CommitInfo, error
 // snapshotExists reports whether a Snapshots row exists for (repo, snapshot_id).
 func snapshotExists(ctx context.Context, sp *spanner.Client, repo, snapshotID string) (bool, error) {
 	stmt := spanner.Statement{
-		SQL:    `SELECT 1 FROM Snapshots WHERE repo = @repo AND snapshot_id = @snap LIMIT 1`,
+		SQL:    `SELECT 1 FROM Snapshots WHERE repo = @repo AND snapshot_id = @snap AND kind != 'staging' LIMIT 1`,
 		Params: map[string]interface{}{"repo": repo, "snap": snapshotID},
 	}
 	iter := sp.Single().Query(ctx, stmt)
@@ -898,45 +929,65 @@ type DependentsResult struct {
 // free: symbol_id = uuidv5(fqn) is global, so an edge from repo B into repo
 // A's exported function already points at the same symbol_id.
 func doDependents(ctx context.Context, sp *spanner.Client, fqn string) (*DependentsResult, error) {
-	// Dependents are CALLS/REFERENCES/IMPLEMENTS/EMBEDS — all content-sourced,
-	// so they live entirely in SymbolEdges. A SymbolEdge is "live" in a repo's
-	// latest snapshot iff that snapshot has a member at the edge's source
-	// symbol-version.
-	stmt := spanner.Statement{
-		SQL: `WITH latest AS (
-		        SELECT repo,
-		               ARRAY_AGG(snapshot_id ORDER BY commit_time DESC LIMIT 1)[OFFSET(0)] AS snapshot_id
-		        FROM Snapshots
-		        WHERE kind = 'ingested'
-		        GROUP BY repo
-		      )
-		      SELECT DISTINCT sm.repo, sm.fqn, e.kind
-		      FROM SymbolEdges AS e
-		      JOIN SnapshotMembers AS sm
-		        ON sm.symbol_id = e.src_symbol_id AND sm.content_hash = e.src_content_hash
-		      JOIN latest AS l ON l.repo = sm.repo AND l.snapshot_id = sm.snapshot_id
-		      WHERE e.dst_symbol_id = @id
-		        AND e.kind IN ('CALLS', 'REFERENCES', 'IMPLEMENTS', 'EMBEDS')
-		      ORDER BY sm.repo, sm.fqn`,
-		Params: map[string]interface{}{"id": uuidFromFQN(fqn)},
-	}
+	stmt := spanner.Statement{SQL: `SELECT repo, snapshot_id
+		FROM Snapshots WHERE kind = 'ingested'
+		ORDER BY repo, commit_time DESC`}
 	iter := sp.Single().Query(ctx, stmt)
-	defer iter.Stop()
-	res := &DependentsResult{FQN: fqn}
+	latest := map[string]string{}
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
+			iter.Stop()
 			return nil, err
 		}
-		var d Dependent
-		if err := row.Columns(&d.Repo, &d.FQN, &d.EdgeKind); err != nil {
+		var repo, snapshot string
+		if err := row.Columns(&repo, &snapshot); err != nil {
+			iter.Stop()
 			return nil, err
 		}
-		res.Dependents = append(res.Dependents, d)
+		if _, ok := latest[repo]; !ok {
+			latest[repo] = snapshot
+		}
 	}
+	iter.Stop()
+	res := &DependentsResult{FQN: fqn}
+	targetID := uuidFromFQN(fqn)
+	seen := map[Dependent]struct{}{}
+	for repo, snapshot := range latest {
+		edges, err := loadSnapshotEdges(ctx, sp, repo, snapshot)
+		if err != nil {
+			return nil, err
+		}
+		meta, err := snapshotMemberMeta(ctx, sp, repo, snapshot)
+		if err != nil {
+			return nil, err
+		}
+		for _, edge := range edges {
+			if edge.Dst != targetID || (edge.Kind != "CALLS" && edge.Kind != "REFERENCES" && edge.Kind != "IMPLEMENTS" && edge.Kind != "EMBEDS") {
+				continue
+			}
+			source, ok := meta[edge.Src]
+			if !ok {
+				continue
+			}
+			seen[Dependent{Repo: repo, FQN: source.FQN, EdgeKind: edge.Kind}] = struct{}{}
+		}
+	}
+	for dependent := range seen {
+		res.Dependents = append(res.Dependents, dependent)
+	}
+	sort.Slice(res.Dependents, func(i, j int) bool {
+		if res.Dependents[i].Repo != res.Dependents[j].Repo {
+			return res.Dependents[i].Repo < res.Dependents[j].Repo
+		}
+		if res.Dependents[i].FQN != res.Dependents[j].FQN {
+			return res.Dependents[i].FQN < res.Dependents[j].FQN
+		}
+		return res.Dependents[i].EdgeKind < res.Dependents[j].EdgeKind
+	})
 	return res, nil
 }
 

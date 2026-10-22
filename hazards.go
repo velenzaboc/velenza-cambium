@@ -21,7 +21,7 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// HazardEdgeKinds enumerates all SSA/VTA/AST hazard edges stored in SymbolEdges / SnapshotEdges.
+// HazardEdgeKinds enumerates all SSA/VTA/AST hazard edges stored in SnapshotEdges.
 var HazardEdgeKinds = []string{
 	"MAP_ESCAPE_UNDER_LOCK",
 	"SLICE_ESCAPE_UNDER_LOCK",
@@ -239,7 +239,6 @@ func collectSSAHazardEdges(
 			acquiresLock = fnAcquiresAnyLock(fn)
 		}
 
-		hasShiftBound := fnHasShiftUpperBound(fn)
 		acceptsCtx := fnAcceptsContext(ownerFn)
 
 		// Compute loop membership for basic blocks in fn.
@@ -290,7 +289,7 @@ func collectSSAHazardEdges(
 
 				case *ssa.BinOp:
 					if ins.Op == token.SHL {
-						if _, isConst := ins.Y.(*ssa.Const); !isConst && !hasShiftBound {
+						if _, isConst := ins.Y.(*ssa.Const); !isConst && !shiftOperandHasUpperBound(ins.Y, b) {
 							sink := ensureSink("sink:unbounded_shift:"+callerFQN, "unbounded shift", ownerFn)
 							addEdge(callerFQN, sink, "UNBOUNDED_SHIFT")
 						}
@@ -701,34 +700,126 @@ func funcCallsBuiltinRecover(fn *ssa.Function) bool {
 	return false
 }
 
-func fnHasShiftUpperBound(fn *ssa.Function) bool {
-	if fn == nil {
-		return false
+type shiftBoundPoint struct {
+	value ssa.Value
+	block *ssa.BasicBlock
+}
+
+func shiftOperandHasUpperBound(value ssa.Value, block *ssa.BasicBlock) bool {
+	return shiftValueBoundedAt(value, block, map[shiftBoundPoint]bool{}, map[*ssa.BasicBlock]bool{})
+}
+
+func shiftValueBoundedAt(value ssa.Value, block *ssa.BasicBlock, values map[shiftBoundPoint]bool, blocks map[*ssa.BasicBlock]bool) bool {
+	if isSmallPositiveShiftConst(value) {
+		return true
 	}
-	for _, b := range fn.Blocks {
-		for _, instr := range b.Instrs {
-			bin, ok := instr.(*ssa.BinOp)
-			if !ok {
+	switch v := value.(type) {
+	case *ssa.ChangeType:
+		return shiftValueBoundedAt(v.X, block, values, blocks)
+	case *ssa.Convert:
+		return shiftValueBoundedAt(v.X, block, values, blocks)
+	case *ssa.Phi:
+		point := shiftBoundPoint{value: value, block: block}
+		if values[point] || len(v.Edges) != len(v.Block().Preds) {
+			return false
+		}
+		values[point] = true
+		defer delete(values, point)
+		for i, edge := range v.Edges {
+			pred := v.Block().Preds[i]
+			if shiftValueBoundedAt(edge, pred, values, blocks) || edgeConstrainsShiftUpperBound(pred, v.Block(), edge) {
 				continue
 			}
-			switch bin.Op {
-			case token.LSS, token.LEQ, token.GTR, token.GEQ:
-				if isSmallPositiveShiftConst(bin.X) || isSmallPositiveShiftConst(bin.Y) {
-					return true
-				}
-			}
+			return false
 		}
+		return len(v.Edges) > 0
+	}
+	return allPathsConstrainShiftValue(block, value, blocks)
+}
+
+func allPathsConstrainShiftValue(block *ssa.BasicBlock, value ssa.Value, visiting map[*ssa.BasicBlock]bool) bool {
+	if block == nil || len(block.Preds) == 0 || visiting[block] {
+		return false
+	}
+	visiting[block] = true
+	defer delete(visiting, block)
+	for _, pred := range block.Preds {
+		if edgeConstrainsShiftUpperBound(pred, block, value) || allPathsConstrainShiftValue(pred, value, visiting) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func edgeConstrainsShiftUpperBound(pred, succ *ssa.BasicBlock, value ssa.Value) bool {
+	if pred == nil || succ == nil || len(pred.Instrs) == 0 {
+		return false
+	}
+	branch, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
+	if !ok {
+		return false
+	}
+	trueEdge := len(pred.Succs) > 0 && pred.Succs[0] == succ
+	falseEdge := len(pred.Succs) > 1 && pred.Succs[1] == succ
+	if !trueEdge && !falseEdge {
+		return false
+	}
+	comparison, ok := branch.Cond.(*ssa.BinOp)
+	if !ok {
+		return false
+	}
+	if comparison.X == value {
+		limit, ok := shiftBoundConstant(comparison.Y)
+		return ok && comparisonBoundsLeft(comparison.Op, trueEdge, falseEdge, limit)
+	}
+	if comparison.Y == value {
+		limit, ok := shiftBoundConstant(comparison.X)
+		return ok && comparisonBoundsRight(comparison.Op, trueEdge, falseEdge, limit)
 	}
 	return false
 }
 
-func isSmallPositiveShiftConst(v ssa.Value) bool {
+func comparisonBoundsLeft(op token.Token, trueEdge, falseEdge bool, limit int64) bool {
+	switch op {
+	case token.LSS:
+		return trueEdge && limit >= 1 && limit <= 64
+	case token.LEQ:
+		return trueEdge && limit >= 0 && limit <= 63
+	case token.GTR:
+		return falseEdge && limit >= 0 && limit <= 63
+	case token.GEQ:
+		return falseEdge && limit >= 1 && limit <= 64
+	}
+	return false
+}
+
+func comparisonBoundsRight(op token.Token, trueEdge, falseEdge bool, limit int64) bool {
+	switch op {
+	case token.GTR:
+		return trueEdge && limit >= 1 && limit <= 64
+	case token.GEQ:
+		return trueEdge && limit >= 0 && limit <= 63
+	case token.LSS:
+		return falseEdge && limit >= 0 && limit <= 63
+	case token.LEQ:
+		return falseEdge && limit >= 1 && limit <= 64
+	}
+	return false
+}
+
+func shiftBoundConstant(v ssa.Value) (int64, bool) {
 	c, ok := v.(*ssa.Const)
 	if !ok || c.Value == nil {
-		return false
+		return 0, false
 	}
 	n, err := strconv.ParseInt(c.Value.ExactString(), 10, 64)
-	if err != nil {
+	return n, err == nil
+}
+
+func isSmallPositiveShiftConst(v ssa.Value) bool {
+	n, ok := shiftBoundConstant(v)
+	if !ok {
 		return false
 	}
 	return n >= 1 && n <= 63
@@ -1265,41 +1356,16 @@ func doHazards(ctx context.Context, sp *spanner.Client, repo, snap string, opts 
 	}
 	iter.Stop()
 
-	var edges []Edge
-	edgeQueries := []string{
-		`SELECT e.src_symbol_id, e.dst_symbol_id, e.kind
-		 FROM SnapshotMembers AS m
-		 JOIN SymbolEdges AS e
-		   ON m.symbol_id = e.src_symbol_id AND m.content_hash = e.src_content_hash
-		 WHERE m.repo = @repo AND m.snapshot_id = @snap`,
-		`SELECT symbol_id AS src_symbol_id, dst_symbol_id, kind
-		 FROM SnapshotEdges
-		 WHERE repo = @repo AND snapshot_id = @snap`,
+	rows, err := loadSnapshotEdges(ctx, sp, repo, snap)
+	if err != nil {
+		return nil, err
 	}
-	for _, q := range edgeQueries {
-		eIter := sp.Single().Query(ctx, spanner.Statement{
-			SQL:    q,
-			Params: map[string]interface{}{"repo": repo, "snap": snap},
+	edges := make([]Edge, 0, len(rows))
+	for _, row := range rows {
+		edges = append(edges, Edge{
+			Repo: repo, SnapshotID: snap,
+			SrcID: row.Src, DstID: row.Dst, Kind: row.Kind,
 		})
-		for {
-			row, err := eIter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				eIter.Stop()
-				return nil, err
-			}
-			var e Edge
-			if err := row.Columns(&e.SrcID, &e.DstID, &e.Kind); err != nil {
-				eIter.Stop()
-				return nil, err
-			}
-			e.Repo = repo
-			e.SnapshotID = snap
-			edges = append(edges, e)
-		}
-		eIter.Stop()
 	}
 
 	return evaluateHazardsFromGraphWithOpts(repo, snap, syms, edges, opts), nil

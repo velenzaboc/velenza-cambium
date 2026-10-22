@@ -270,6 +270,9 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 	if err != nil {
 		return nil, err
 	}
+	if err := validateTrackedFileBoundaries(repoPath); err != nil {
+		return nil, fmt.Errorf("tracked file boundary: %w", err)
+	}
 	// Derive repo name from the SHARED git dir so worktrees of the same repo
 	// produce the same name (otherwise diff across worktrees breaks).
 	repoName, err := deriveRepoName(repoPath)
@@ -302,6 +305,7 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 		commitTime = time.Now()
 		parents = []string{opts.baseSnapID}
 	}
+	stagingSnapshotID := uuid.NewString()
 	progress("start", 0, 0, fmt.Sprintf("repo=%s snapshot=%s kind=%s", repoName, snapshotID, opts.kind))
 
 	progress("walk", 0, 0, "loading packages + AST + CHA")
@@ -343,8 +347,8 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 		}
 	}
 
-	// Split edges: content-sourced edges are version-keyed and cached in
-	// SymbolEdges; structural edges (source is a package/file) stay per-snapshot.
+	// Split edges for progress reporting and write ordering. Both sets are
+	// snapshot-scoped because whole-program resolution affects content sources.
 	hashByID := make(map[string]string, len(syms))
 	kindByID := make(map[string]string, len(syms))
 	for _, s := range syms {
@@ -353,6 +357,7 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 	}
 	var symbolEdges, structuralEdges []Edge
 	for _, e := range edges {
+		e.SnapshotID = stagingSnapshotID
 		srcKind := kindByID[e.SrcID]
 		if h := hashByID[e.SrcID]; h != "" && srcKind != "package" && srcKind != "file" {
 			e.SrcContentHash = h
@@ -362,28 +367,33 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 		}
 	}
 
-	// A re-ingest of this snapshot_id fully REPLACES it — clear any prior
-	// rows first so a changed extraction cannot leave stale members/edges
-	// merged with the fresh ones.
-	if exists, err := snapshotExists(ctx, sp, repoName, snapshotID); err != nil {
-		return nil, fmt.Errorf("check existing snapshot: %w", err)
-	} else if exists {
-		if err := deleteSnapshotData(ctx, sp, repoName, snapshotID); err != nil {
-			return nil, fmt.Errorf("clear prior snapshot: %w", err)
-		}
+	stagedSyms := make([]Symbol, len(syms))
+	copy(stagedSyms, syms)
+	for i := range stagedSyms {
+		stagedSyms[i].SnapshotID = stagingSnapshotID
 	}
 
-	// The Snapshots parent row must exist before its interleaved children.
-	if err := writeSnapshot(ctx, sp, repoName, snapshotID, label, commitSHA, commitTime, branch, parents, opts, distinctSymbolCount(syms)); err != nil {
-		return nil, fmt.Errorf("write snapshot: %w", err)
+	// Build a complete private staging snapshot. The existing public snapshot,
+	// if any, remains readable until publishStagedSnapshot atomically replaces it.
+	publishedKind := opts.kind
+	stagingOpts := opts
+	stagingOpts.kind = "staging"
+	if err := writeSnapshot(ctx, sp, repoName, stagingSnapshotID, label, commitSHA, commitTime, branch, parents, stagingOpts, distinctSymbolCount(syms)); err != nil {
+		return nil, fmt.Errorf("write staging snapshot: %w", err)
 	}
-	if err := writeSymbolVersions(ctx, sp, syms, progress); err != nil {
+	stagingLive := true
+	defer func() {
+		if stagingLive {
+			_ = deleteSnapshotData(ctx, sp, repoName, stagingSnapshotID)
+		}
+	}()
+	if err := writeSymbolVersions(ctx, sp, stagedSyms, progress); err != nil {
 		return nil, fmt.Errorf("write symbol versions: %w", err)
 	}
-	if err := writeSnapshotMembers(ctx, sp, syms, progress); err != nil {
+	if err := writeSnapshotMembers(ctx, sp, stagedSyms, progress); err != nil {
 		return nil, fmt.Errorf("write snapshot members: %w", err)
 	}
-	if err := writeSymbolEdges(ctx, sp, symbolEdges, progress); err != nil {
+	if err := writeSnapshotSymbolEdges(ctx, sp, repoName, stagingSnapshotID, symbolEdges, progress); err != nil {
 		return nil, fmt.Errorf("write symbol edges: %w", err)
 	}
 	if err := writeStructuralEdges(ctx, sp, structuralEdges, progress); err != nil {
@@ -395,12 +405,16 @@ func doIngest(ctx context.Context, sp *spanner.Client, repoPathRaw string, opts 
 	// byte-exact backstop + non-Go carrier); phase B1 decomposes every .go file
 	// into the structural master (GoFileChunks + DeclSource). Both additive —
 	// independent of the analysis graph above.
-	if err := captureFiles(ctx, sp, repoPath, repoName, snapshotID, progress); err != nil {
+	if err := captureFiles(ctx, sp, repoPath, repoName, stagingSnapshotID, progress); err != nil {
 		return nil, fmt.Errorf("capture files: %w", err)
 	}
-	if err := captureGoChunks(ctx, sp, repoPath, repoName, snapshotID, progress); err != nil {
+	if err := captureGoChunks(ctx, sp, repoPath, repoName, stagingSnapshotID, progress); err != nil {
 		return nil, fmt.Errorf("capture go chunks: %w", err)
 	}
+	if err := publishStagedSnapshot(ctx, sp, repoName, stagingSnapshotID, snapshotID, publishedKind); err != nil {
+		return nil, fmt.Errorf("publish snapshot: %w", err)
+	}
+	stagingLive = false
 	// Rename/move stitching only applies to real commit history, not hypotheticals.
 	if opts.kind == "ingested" {
 		if err := detectAliases(ctx, sp, repoName, snapshotID, progress); err != nil {
@@ -701,7 +715,7 @@ func collectDecls(
 	for _, decl := range f.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			fqn := funcFQN(pkgFQN, d)
+			fqn := funcFQNAt(pkgFQN, d, fset)
 			sig, body := renderFunc(fset, d)
 			rel, _ := filepath.Rel(repoPath, fset.Position(d.Pos()).Filename)
 			kind := "func"
@@ -814,7 +828,7 @@ func collectEdges(pkg *packages.Package, f *ast.File, fset *token.FileSet, addEd
 		if !ok || fd.Body == nil {
 			continue
 		}
-		caller := funcFQN(pkgFQN, fd)
+		caller := funcFQNAt(pkgFQN, fd, fset)
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.CallExpr:
@@ -983,6 +997,10 @@ func ssaFuncFQN(fn *ssa.Function) string {
 			return recvFQN + "." + fn.Name()
 		}
 	}
+	if fn.Name() == "init" && fn.Prog != nil && fn.Prog.Fset != nil {
+		pos := fn.Prog.Fset.Position(fn.Pos())
+		return fmt.Sprintf("%s.init@%s:%d", pkgPath, filepath.Base(pos.Filename), pos.Line)
+	}
 	return pkgPath + "." + fn.Name()
 }
 
@@ -1080,6 +1098,16 @@ func funcFQN(pkgFQN string, d *ast.FuncDecl) string {
 		return pkgFQN + "." + id.Name + "." + d.Name.Name
 	}
 	return pkgFQN + "." + d.Name.Name
+}
+
+func funcFQNAt(pkgFQN string, d *ast.FuncDecl, fset *token.FileSet) string {
+	base := funcFQN(pkgFQN, d)
+	if d.Recv != nil || d.Name.Name != "init" || fset == nil {
+		return base
+	}
+	pos := fset.Position(d.Pos())
+	file := filepath.Base(pos.Filename)
+	return fmt.Sprintf("%s@%s:%d", base, file, pos.Line)
 }
 
 func renderFunc(fset *token.FileSet, d *ast.FuncDecl) (sig, body string) {
@@ -1416,6 +1444,103 @@ func writeSnapshot(ctx context.Context, sp *spanner.Client, repo, snapshotID, la
 	return err
 }
 
+func publishStagedSnapshot(ctx context.Context, sp *spanner.Client, repo, stagingSnapshotID, snapshotID, publishedKind string) error {
+	row, err := sp.Single().ReadRow(ctx, "Snapshots", spanner.Key{repo, stagingSnapshotID},
+		[]string{"label", "commit_sha", "commit_time", "base_snapshot_id", "parent_snapshot_ids", "branch", "symbol_count", "ingested_at"})
+	if err != nil {
+		return err
+	}
+	var label, commitSHA string
+	var commitTime spanner.NullTime
+	var base, branch spanner.NullString
+	var parents []string
+	var symbolCount int64
+	var ingestedAt time.Time
+	if err := row.Columns(&label, &commitSHA, &commitTime, &base, &parents, &branch, &symbolCount, &ingestedAt); err != nil {
+		return err
+	}
+	muts := []*spanner.Mutation{spanner.Replace("Snapshots",
+		[]string{"repo", "snapshot_id", "label", "commit_sha", "commit_time", "kind", "base_snapshot_id", "parent_snapshot_ids", "branch", "symbol_count", "ingested_at"},
+		[]interface{}{repo, snapshotID, label, commitSHA, commitTime, publishedKind, base, parents, branch, symbolCount, ingestedAt})}
+	params := map[string]interface{}{"repo": repo, "snap": stagingSnapshotID}
+	appendRows := func(sql string, scan func(*spanner.Row) (*spanner.Mutation, error)) error {
+		iter := sp.Single().Query(ctx, spanner.Statement{SQL: sql, Params: params})
+		defer iter.Stop()
+		for {
+			row, err := iter.Next()
+			if err == iterator.Done {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			mutation, err := scan(row)
+			if err != nil {
+				return err
+			}
+			muts = append(muts, mutation)
+		}
+	}
+	if err := appendRows(`SELECT symbol_id, fqn, content_hash, kind, file_path, line_start, line_end
+		FROM SnapshotMembers WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
+		var symbolID, fqn, memberKind, filePath string
+		var hash spanner.NullString
+		var lineStart, lineEnd int64
+		if err := row.Columns(&symbolID, &fqn, &hash, &memberKind, &filePath, &lineStart, &lineEnd); err != nil {
+			return nil, err
+		}
+		return spanner.InsertOrUpdate("SnapshotMembers",
+			[]string{"repo", "snapshot_id", "symbol_id", "fqn", "content_hash", "kind", "file_path", "line_start", "line_end"},
+			[]interface{}{repo, snapshotID, symbolID, fqn, hash, memberKind, filePath, lineStart, lineEnd}), nil
+	}); err != nil {
+		return err
+	}
+	if err := appendRows(`SELECT symbol_id, dst_symbol_id, kind
+		FROM SnapshotEdges WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
+		var src, dst, edgeKind string
+		if err := row.Columns(&src, &dst, &edgeKind); err != nil {
+			return nil, err
+		}
+		return spanner.InsertOrUpdate("SnapshotEdges",
+			[]string{"repo", "snapshot_id", "symbol_id", "dst_symbol_id", "kind"},
+			[]interface{}{repo, snapshotID, src, dst, edgeKind}), nil
+	}); err != nil {
+		return err
+	}
+	if err := appendRows(`SELECT file_path, content_sha, is_go, file_order
+		FROM SnapshotFiles WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
+		var filePath, contentSHA string
+		var isGo bool
+		var order int64
+		if err := row.Columns(&filePath, &contentSHA, &isGo, &order); err != nil {
+			return nil, err
+		}
+		return spanner.InsertOrUpdate("SnapshotFiles",
+			[]string{"repo", "snapshot_id", "file_path", "content_sha", "is_go", "file_order"},
+			[]interface{}{repo, snapshotID, filePath, contentSHA, isGo, order}), nil
+	}); err != nil {
+		return err
+	}
+	if err := appendRows(`SELECT file_path, chunk_index, chunk_kind, symbol_fqns, content_sha, blank_before
+		FROM GoFileChunks WHERE repo=@repo AND snapshot_id=@snap`, func(row *spanner.Row) (*spanner.Mutation, error) {
+		var filePath, chunkKind, contentSHA string
+		var chunkIndex int64
+		var fqns []string
+		var blank spanner.NullBool
+		if err := row.Columns(&filePath, &chunkIndex, &chunkKind, &fqns, &contentSHA, &blank); err != nil {
+			return nil, err
+		}
+		return spanner.InsertOrUpdate("GoFileChunks",
+			[]string{"repo", "snapshot_id", "file_path", "chunk_index", "chunk_kind", "symbol_fqns", "content_sha", "blank_before"},
+			[]interface{}{repo, snapshotID, filePath, chunkIndex, chunkKind, fqns, contentSHA, blank}), nil
+	}); err != nil {
+		return err
+	}
+	muts = append(muts, spanner.Delete("Snapshots", spanner.Key{repo, stagingSnapshotID}))
+	_, err = sp.Apply(ctx, muts)
+	return err
+}
+
 // writeSymbolVersions upserts the immutable (symbol_id, content_hash) spine.
 // Only content-bearing symbols; idempotent — re-ingesting an existing version
 // is a no-op overwrite.
@@ -1477,8 +1602,8 @@ func writeSnapshotMembers(ctx context.Context, sp *spanner.Client, syms []Symbol
 	return nil
 }
 
-// writeStructuralEdges writes DECLARES/IMPORTS edges per snapshot. Their
-// source is a package or file (no content body) so they cannot be cached.
+// writeStructuralEdges appends DECLARES/IMPORTS rows to the snapshot's complete
+// edge set after content-derived rows have established the replacement marker.
 func writeStructuralEdges(ctx context.Context, sp *spanner.Client, edges []Edge, progress ProgressFunc) error {
 	for start := 0; start < len(edges); start += mutationBatch {
 		end := start + mutationBatch
@@ -1500,30 +1625,34 @@ func writeStructuralEdges(ctx context.Context, sp *spanner.Client, edges []Edge,
 	return nil
 }
 
-// writeSymbolEdges writes content-sourced edges keyed by source symbol-version.
-//
-// Edges are recomputed and rewritten on every ingest — there is deliberately no
-// "skip if already stored" cache. A symbol's edge set is NOT a pure function of
-// its own body bytes: CHA call edges depend on the whole-program type lattice,
-// and AST edges depend on the package type-checking cleanly. A cache keyed only
-// on (src_symbol_id, src_content_hash) therefore froze stale/degraded edge sets
-// — an ingest that hit a partial type-check cached an incomplete edge set, and
-// every later ingest skipped that version because its body hash was unchanged,
-// producing false orphans (origin: EnforcePolicy flagged ORPHAN
-// despite a static call at cmd/server.run). Embeddings (SymbolBlobs) ARE a pure
-// function of body text, so that cache stays; edges are not, so they do not.
-//
-// Each source-version's existing rows are deleted before its fresh edges are
-// inserted, so a corrected extraction also clears edges it no longer produces.
-// edgeVerKey identifies a source symbol-version for edge grouping.
-type edgeVerKey struct{ sid, hash string }
+// writeSymbolEdges preserves the historical helper boundary while storing the
+// derived set in the repository snapshot carried by every edge.
+
+const snapshotEdgeSetMarkerKind = "EDGE_SET_COMPLETE"
+
+var snapshotEdgeSetMarkerID = uuidFromFQN("velenza.cambium.snapshot-edge-set")
 
 func writeSymbolEdges(ctx context.Context, sp *spanner.Client, edges []Edge, progress ProgressFunc) error {
-	// Group edges by their source symbol-version.
-	byVersion := map[edgeVerKey][]Edge{}
-	for _, e := range edges {
-		k := edgeVerKey{e.SrcID, e.SrcContentHash}
-		byVersion[k] = append(byVersion[k], e)
+	if len(edges) == 0 {
+		return nil
+	}
+	repo, snapshotID := edges[0].Repo, edges[0].SnapshotID
+	for _, edge := range edges[1:] {
+		if edge.Repo != repo || edge.SnapshotID != snapshotID {
+			return fmt.Errorf("symbol edges span multiple snapshot contexts")
+		}
+	}
+	return writeSnapshotSymbolEdges(ctx, sp, repo, snapshotID, edges, progress)
+}
+
+func writeSnapshotSymbolEdges(ctx context.Context, sp *spanner.Client, repo, snapshotID string, edges []Edge, progress ProgressFunc) error {
+	// A source body is not the full analysis context: interface dispatch and
+	// type resolution can change while the source hash stays constant. Persist
+	// every derived edge in its exact repository snapshot.
+	if _, err := sp.Apply(ctx, []*spanner.Mutation{
+		spanner.Delete("SnapshotEdges", spanner.Key{repo, snapshotID}.AsPrefix()),
+	}); err != nil {
+		return err
 	}
 	apply := func(muts []*spanner.Mutation) error {
 		for start := 0; start < len(muts); start += mutationBatch {
@@ -1537,32 +1666,23 @@ func writeSymbolEdges(ctx context.Context, sp *spanner.Client, edges []Edge, pro
 		}
 		return nil
 	}
-	// Phase 1: delete every touched source-version's existing edge rows, so a
-	// corrected extraction removes edges it no longer emits. Done as its own
-	// commit pass to avoid delete/insert ordering ambiguity on the same key.
-	var dels []*spanner.Mutation
-	for vk := range byVersion {
-		dels = append(dels, spanner.Delete("SymbolEdges",
-			spanner.Key{vk.sid, vk.hash}.AsPrefix()))
-	}
-	if err := apply(dels); err != nil {
-		return err
-	}
-	// Phase 2: insert the freshly-derived edge set.
-	var ins []*spanner.Mutation
-	for _, ves := range byVersion {
-		for _, e := range ves {
-			ins = append(ins, spanner.InsertOrUpdate("SymbolEdges",
-				[]string{"src_symbol_id", "src_content_hash", "dst_symbol_id", "kind"},
-				[]interface{}{e.SrcID, e.SrcContentHash, e.DstID, e.Kind},
-			))
-		}
+	ins := make([]*spanner.Mutation, 0, len(edges))
+	for _, e := range edges {
+		ins = append(ins, spanner.InsertOrUpdate("SnapshotEdges",
+			[]string{"repo", "snapshot_id", "symbol_id", "dst_symbol_id", "kind"},
+			[]interface{}{repo, snapshotID, e.SrcID, e.DstID, e.Kind},
+		))
 	}
 	if err := apply(ins); err != nil {
 		return err
 	}
-	progress("symbol-edges", len(ins), len(ins),
-		fmt.Sprintf("%d edges over %d source-versions (recomputed fresh)", len(ins), len(byVersion)))
+	if _, err := sp.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("SnapshotEdges",
+		[]string{"repo", "snapshot_id", "symbol_id", "dst_symbol_id", "kind"},
+		[]interface{}{repo, snapshotID, snapshotEdgeSetMarkerID, snapshotEdgeSetMarkerID, snapshotEdgeSetMarkerKind},
+	)}); err != nil {
+		return err
+	}
+	progress("symbol-edges", len(ins), len(ins), fmt.Sprintf("%d snapshot-scoped content edges", len(ins)))
 	return nil
 }
 
@@ -1612,12 +1732,12 @@ func cmdNeighbors(ctx context.Context, args []string) error {
 		return err
 	}
 	defer sp.Close()
-	_, snap, note, err := resolveQuerySnapshot(ctx, sp, *snapshot)
+	repo, snap, note, err := resolveQuerySnapshot(ctx, sp, *snapshot)
 	if err != nil {
 		return err
 	}
 	fmt.Println(note)
-	results, err := doNeighbors(ctx, sp, fs.Arg(0), *depth, snap)
+	results, err := doNeighborsInRepo(ctx, sp, fs.Arg(0), *depth, repo, snap)
 	if err != nil {
 		return err
 	}
@@ -2006,12 +2126,12 @@ func cmdGet(ctx context.Context, args []string) error {
 		return err
 	}
 	defer sp.Close()
-	_, snap, note, err := resolveQuerySnapshot(ctx, sp, *snapshot)
+	repo, snap, note, err := resolveQuerySnapshot(ctx, sp, *snapshot)
 	if err != nil {
 		return err
 	}
 	fmt.Println(note)
-	s, err := doGet(ctx, sp, fs.Arg(0), snap)
+	s, err := doGetInRepo(ctx, sp, fs.Arg(0), repo, snap)
 	if err != nil {
 		return err
 	}
