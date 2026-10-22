@@ -147,8 +147,8 @@ func isContentKind(kind string) bool {
 // legitimately has no in-repo caller (main, init, test/benchmark/fuzz/example).
 func isEntrypoint(fqn string) bool {
 	qualifiedName := fqn
-	if i := strings.LastIndex(qualifiedName, "@"); i >= 0 {
-		qualifiedName = qualifiedName[:i]
+	if i := strings.Index(qualifiedName, ".init@"); i >= 0 {
+		qualifiedName = qualifiedName[:i+len(".init")]
 	}
 	leaf := qualifiedName
 	if i := strings.LastIndex(qualifiedName, "."); i >= 0 {
