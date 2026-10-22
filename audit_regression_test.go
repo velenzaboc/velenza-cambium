@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,10 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
+	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"cloud.google.com/go/spanner/spannertest"
 	"cloud.google.com/go/spanner/spansql"
@@ -199,6 +204,90 @@ func newAuditDB(t *testing.T) *spanner.Client {
 	})
 }
 
+func newAuditEmulatorInterceptedDB(t *testing.T, interceptor grpc.UnaryClientInterceptor) *spanner.Client {
+	t.Helper()
+	host := strings.TrimSpace(os.Getenv("SPANNER_EMULATOR_HOST"))
+	if host == "" {
+		t.Fatal("C2 integration regression requires SPANNER_EMULATOR_HOST")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dialOptions := []option.ClientOption{
+		option.WithEndpoint(host),
+		option.WithoutAuthentication(),
+		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+	}
+	instanceAdmin, err := instance.NewInstanceAdminClient(ctx, dialOptions...)
+	if err != nil {
+		t.Fatalf("create emulator instance admin client: %v", err)
+	}
+	t.Cleanup(func() { _ = instanceAdmin.Close() })
+
+	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	projectID := "cambium-audit"
+	instanceID := "c2-" + suffix
+	databaseID := "c2-" + suffix
+	instancePath := fmt.Sprintf("projects/%s/instances/%s", projectID, instanceID)
+	createInstance, err := instanceAdmin.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
+		Parent:     "projects/" + projectID,
+		InstanceId: instanceID,
+		Instance: &instancepb.Instance{
+			Config:      fmt.Sprintf("projects/%s/instanceConfigs/emulator-config", projectID),
+			DisplayName: instanceID,
+			NodeCount:   1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create emulator instance: %v", err)
+	}
+	if _, err := createInstance.Wait(ctx); err != nil {
+		t.Fatalf("wait for emulator instance: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		_ = instanceAdmin.DeleteInstance(cleanupCtx, &instancepb.DeleteInstanceRequest{Name: instancePath})
+	})
+
+	databaseAdmin, err := database.NewDatabaseAdminClient(ctx, dialOptions...)
+	if err != nil {
+		t.Fatalf("create emulator database admin client: %v", err)
+	}
+	auditSchema := strings.Replace(codeGraphTestSchema, "commit_sha STRING(40)", "commit_sha STRING(64)", 1)
+	createDatabase, err := databaseAdmin.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
+		Parent:          instancePath,
+		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", databaseID),
+		ExtraStatements: splitDDL(auditSchema),
+	})
+	if err != nil {
+		_ = databaseAdmin.Close()
+		t.Fatalf("create emulator database: %v", err)
+	}
+	if _, err := createDatabase.Wait(ctx); err != nil {
+		_ = databaseAdmin.Close()
+		t.Fatalf("wait for emulator database: %v", err)
+	}
+	if err := databaseAdmin.Close(); err != nil {
+		t.Fatalf("close emulator database admin client: %v", err)
+	}
+
+	conn, err := grpc.NewClient(host,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(interceptor))
+	if err != nil {
+		t.Fatalf("connect to emulator data API: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	client, err := spanner.NewClient(context.Background(),
+		fmt.Sprintf("%s/databases/%s", instancePath, databaseID), option.WithGRPCConn(conn))
+	if err != nil {
+		t.Fatalf("create emulator Spanner client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	return client
+}
+
 func auditCommitWritesTable(req any, table string) bool {
 	commit, ok := req.(*spannerpb.CommitRequest)
 	if !ok {
@@ -235,7 +324,7 @@ func TestAuditC2InterruptedReplacementIsInvisibleAndRetryRepairsWholeBlob(t *tes
 		}
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
-	client := newAuditInterceptedDB(t, interceptor)
+	client := newAuditEmulatorInterceptedDB(t, interceptor)
 	previousRequest := requestEmbeddings
 	requestEmbeddings = func(_ context.Context, texts []string, _ string) ([][]float32, error) {
 		vectors := make([][]float32, len(texts))
