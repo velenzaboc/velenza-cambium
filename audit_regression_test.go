@@ -86,11 +86,7 @@ func auditInstallEmbeddings(t *testing.T) {
 func TestAuditC1ConsumesRealInarchWorkspaceWithoutGit(t *testing.T) {
 	binary := os.Getenv("VELENZA_INR_BIN")
 	if binary == "" {
-		var err error
-		binary, err = exec.LookPath("inr")
-		if err != nil {
-			t.Fatalf("real Inarch producer is required: set VELENZA_INR_BIN or install inr: %v", err)
-		}
+		t.Fatal("set VELENZA_INR_BIN to the verified source-built Inarch producer")
 	}
 	home := t.TempDir()
 	repo := filepath.Join(t.TempDir(), "native")
@@ -258,7 +254,7 @@ func newAuditEmulatorInterceptedDB(t *testing.T, interceptor grpc.UnaryClientInt
 	createDatabase, err := databaseAdmin.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          instancePath,
 		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", databaseID),
-		ExtraStatements: splitDDL(auditSchema),
+		ExtraStatements: splitDDL(strings.ReplaceAll(auditSchema, "TIMESTAMP NOT NULL", "TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)")),
 	})
 	if err != nil {
 		_ = databaseAdmin.Close()
@@ -608,24 +604,34 @@ func TestAuditC4ZeroEdgeReingestClearsStaleVersionEdges(t *testing.T) {
 	if err != nil || row.Columns(&contentHash) != nil {
 		t.Fatalf("load leaf version hash: %v", err)
 	}
-	applyTestMutations(t, client, spanner.Insert("SymbolEdges",
-		[]string{"src_symbol_id", "src_content_hash", "dst_symbol_id", "kind"},
-		[]any{symbolID, contentHash, uuidFromFQN("example.test/leaf.Stale"), "CALLS"}))
+	staleID := uuidFromFQN("example.test/leaf.Stale")
+	if err := writeSymbolEdges(ctx, client, []Edge{{Repo: stats.Repo, SnapshotID: stats.SnapshotID, SrcID: symbolID, SrcContentHash: contentHash, DstID: staleID, Kind: "CALLS"}}, auditNoProgress); err != nil {
+		t.Fatal(err)
+	}
+	before, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, edge := range before {
+		if edge.Src == symbolID && edge.Dst == staleID && edge.Kind == "CALLS" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("fixture did not establish a visible stale edge")
+	}
 	if _, err := doIngest(ctx, client, repoPath, ingestOpts{}, auditNoProgress); err != nil {
 		t.Fatal(err)
 	}
-	countIter := client.Single().Query(ctx, spanner.Statement{
-		SQL: "SELECT COUNT(*) FROM SymbolEdges WHERE src_symbol_id=@sid AND src_content_hash=@hash",
-		Params: map[string]any{"sid": symbolID, "hash": contentHash},
-	})
-	countRow, err := countIter.Next()
-	countIter.Stop()
-	var count int64
-	if err != nil || countRow.Columns(&count) != nil {
-		t.Fatalf("count stale leaf edges: %v", err)
+	after, err := loadSnapshotEdges(ctx, client, stats.Repo, stats.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("zero-edge reingest retained %d stale edge(s)", count)
+	for _, edge := range after {
+		if edge.Src == symbolID && edge.Dst == staleID && edge.Kind == "CALLS" {
+			t.Fatalf("zero-edge reingest retained a visible stale edge: %+v", edge)
+		}
 	}
 }
 
