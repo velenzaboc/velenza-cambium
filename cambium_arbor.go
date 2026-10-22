@@ -191,22 +191,25 @@ func readSimpleTOML(path string) (map[string]string, error) {
 // Inarch writes the lease as TOML despite its historical .json filename.
 // Older workspaces did write JSON, so retain that format as read compatibility.
 func readInarchLease(path string) (map[string]string, error) {
-	values, err := readSimpleTOML(path)
-	if err != nil {
-		return nil, err
-	}
-	if len(values) != 0 {
-		return values, nil
-	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var legacy map[string]string
-	if err := json.Unmarshal(raw, &legacy); err != nil {
-		return nil, err
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
+		var legacy map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &legacy); err != nil {
+			return nil, err
+		}
+		values := make(map[string]string)
+		for _, key := range []string{"head_changeset_id", "base_changeset_id", "changeset_id", "bookmark", "branch"} {
+			var value string
+			if encoded, ok := legacy[key]; ok && json.Unmarshal(encoded, &value) == nil {
+				values[key] = value
+			}
+		}
+		return values, nil
 	}
-	return legacy, nil
+	return readSimpleTOML(path)
 }
 
 func inarchBranch(repoPath string) string {

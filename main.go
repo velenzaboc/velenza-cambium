@@ -2004,9 +2004,25 @@ func cmdListCommits(ctx context.Context, args []string) error {
 // deleteSnapshotData removes a public logical snapshot. Immutable generations
 // are retained because a reader may already have resolved the old pointer; a
 // later lifecycle policy may reclaim generations that are proven unreachable.
-// Legacy snapshots have interleaved children under their own logical ID, which
-// Spanner removes with the parent cascade.
+// Legacy snapshots have interleaved children under their own logical ID, so
+// retain their bounded partitioned-delete path before removing the parent.
 func deleteSnapshotData(ctx context.Context, sp *spanner.Client, repo, snap string) error {
+	row, err := sp.Single().ReadRow(ctx, "Snapshots", spanner.Key{repo, snap},
+		[]string{"kind", "storage_snapshot_id"})
+	if err != nil {
+		return err
+	}
+	var kind string
+	var storage spanner.NullString
+	if err := row.Columns(&kind, &storage); err != nil {
+		return err
+	}
+	if kind == "staging" {
+		return fmt.Errorf("snapshot %q for repo %q is private staging data", snap, repo)
+	}
+	if !storage.Valid || storage.StringVal == "" {
+		return deleteSnapshotGenerationData(ctx, sp, repo, snap)
+	}
 	if _, err := sp.Apply(ctx, []*spanner.Mutation{
 		spanner.Delete("Snapshots", spanner.Key{repo, snap}),
 	}); err != nil {
@@ -2015,8 +2031,9 @@ func deleteSnapshotData(ctx context.Context, sp *spanner.Client, repo, snap stri
 	return nil
 }
 
-// deleteSnapshotGenerationData is only for a private generation that has been
-// proven not to be referenced by its logical snapshot row.
+// deleteSnapshotGenerationData removes child partitions before their owning
+// snapshot row. Callers use it for an unpublished private generation or a
+// legacy public snapshot whose child rows share its logical ID.
 func deleteSnapshotGenerationData(ctx context.Context, sp *spanner.Client, repo, snap string) error {
 	params := map[string]interface{}{"repo": repo, "snap": snap}
 	for _, t := range []string{"SnapshotEdges", "SnapshotMembers", "SnapshotFiles", "GoFileChunks"} {

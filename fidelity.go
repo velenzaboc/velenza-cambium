@@ -13,6 +13,8 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Fidelity layer — lossless source capture for the ingest → edit → manifest
@@ -342,6 +344,9 @@ func loadSnapshotFilesFromGeneration(ctx context.Context, sp *spanner.Client, re
 func doManifest(ctx context.Context, sp *spanner.Client, repo, snapshotID, outDir string, fromStructure bool) (int, error) {
 	ref, err := resolveSnapshotRef(ctx, sp, repo, snapshotID)
 	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return 0, fmt.Errorf("snapshot %q for repo %q is not ingested: %w", snapshotID, repo, err)
+		}
 		return 0, err
 	}
 	files, err := loadSnapshotFilesFromGeneration(ctx, sp, repo, ref.StorageID)

@@ -146,9 +146,13 @@ func isContentKind(kind string) bool {
 // isEntrypoint reports whether an FQN's leaf name is a Go entrypoint that
 // legitimately has no in-repo caller (main, init, test/benchmark/fuzz/example).
 func isEntrypoint(fqn string) bool {
-	leaf := fqn
-	if i := strings.LastIndex(fqn, "."); i >= 0 {
-		leaf = fqn[i+1:]
+	qualifiedName := fqn
+	if i := strings.LastIndex(qualifiedName, "@"); i >= 0 {
+		qualifiedName = qualifiedName[:i]
+	}
+	leaf := qualifiedName
+	if i := strings.LastIndex(qualifiedName, "."); i >= 0 {
+		leaf = qualifiedName[i+1:]
 	}
 	if leaf == "main" || leaf == "init" || strings.HasPrefix(leaf, "init@") {
 		return true
