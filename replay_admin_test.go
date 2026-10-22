@@ -21,11 +21,12 @@ import (
 
 type fakeReplayService struct {
 	mu          sync.Mutex
-	exists      map[string]bool
-	snapshotErr error
-	ingestErr   error
-	ingested    []string
-	closed      bool
+	exists       map[string]bool
+	snapshotErr  error
+	ingestErr    error
+	ingestErrors []error
+	ingested     []string
+	closed       bool
 }
 
 func (s *fakeReplayService) Close() {
@@ -45,6 +46,10 @@ func (s *fakeReplayService) Ingest(_ context.Context, repoPath string) (*IngestS
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ingested = append(s.ingested, repoPath)
+	call := len(s.ingested) - 1
+	if call < len(s.ingestErrors) && s.ingestErrors[call] != nil {
+		return nil, s.ingestErrors[call]
+	}
 	if s.ingestErr != nil {
 		return nil, s.ingestErr
 	}
@@ -114,8 +119,8 @@ func TestReplayCommandRecordsSnapshotAndIngestFailures(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			installReplayService(t, tc.service, nil)
-			if err := cmdReplay(ctx, []string{"--workers=1", repo}); err != nil {
-				t.Fatalf("replay returns aggregate failures after worker completion: %v", err)
+			if err := cmdReplay(ctx, []string{"--workers=1", repo}); err == nil {
+				t.Fatal("replay returned success after worker failure")
 			}
 			if !tc.service.closed {
 				t.Fatal("replay did not close its service")
@@ -162,8 +167,8 @@ func TestUpdateCommandSelectsOnlyMissingTips(t *testing.T) {
 	}
 	ingestFailure := &fakeReplayService{exists: map[string]bool{}, ingestErr: errors.New("ingest failed")}
 	installReplayService(t, ingestFailure, nil)
-	if err := cmdUpdate(ctx, []string{repo}); err != nil {
-		t.Fatalf("update returns aggregate ingest failures after cleanup: %v", err)
+	if err := cmdUpdate(ctx, []string{repo}); err == nil {
+		t.Fatal("update returned success after ingest failure")
 	}
 	if len(ingestFailure.ingested) != 1 || !ingestFailure.closed {
 		t.Fatalf("failed update did not attempt exactly one cleanup-bounded ingest: %+v", ingestFailure)
