@@ -798,7 +798,9 @@ func TestAuditLargeSnapshotPublicationIsBoundedAndAtomicallyVisible(t *testing.T
 	}
 
 	publishing.Store(true)
-	err := publishStagedSnapshot(ctx, client, repo, stagingSnapshot, publicSnapshot, "ingested")
+	publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := publishStagedSnapshot(publishCtx, client, repo, stagingSnapshot, publicSnapshot, "ingested")
+	cancel()
 	publishing.Store(false)
 	if err != nil {
 		t.Errorf("bounded large snapshot publication failed: %v", err)
