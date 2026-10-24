@@ -1,0 +1,44 @@
+# Velenza Inarch Configuration File (inarch.toml / .inarch/config.toml)
+# All environment-specific paths, identities, ignore lists, and ACL policies
+# are configured here rather than hardcoded in source code.
+
+[repository]
+repo_id = "default"
+default_ref = "main"
+default_author = "developer@inarch.local"
+tz_offset_secs = 0
+ignore_names = [".git", ".inarch", "target", "node_modules"]
+
+[network]
+listen_addr = "127.0.0.1:7331"
+remote_url = "http://10.0.0.11:7331"
+auth_token = ""
+gcp_credentials_file = "/Users/brandon/.config/no13-backup/kopia-macmini.json"
+jit_lease_file = ""
+jit_signing_key = ""
+oidc_tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo"
+oidc_token_uri = ""
+oidc_audience = ""
+
+[storage]
+store_dir = ".inarch/store"
+blobs_subdir = "blobs"
+meta_subdir = "meta"
+tier1_cache_dir = ""
+tier2_cache_dir = ""
+blob_backend = "local"
+gcs_bucket = ""
+gcs_prefix = ""
+meta_backend = "local"
+spanner_database = ""
+
+[chunking]
+min_size = 16384
+avg_size = 65536
+max_size = 262144
+
+[telemetry]
+log_backend = "none"
+log_level = "info"
+log_file = ".inarch/logs/inarch.jsonl"
+gcp_log_name = ""

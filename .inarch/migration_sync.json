@@ -1,0 +1,9 @@
+{
+  "schema": "velenza_inarch_repo_sync/1",
+  "repo": "velenza-cambium",
+  "mode": "dual_mirror",
+  "git_head": "817fd2886dd0643199d2bb9822b5a673079a6c32",
+  "inr_binary_imported": true,
+  "synced_at": "2026-10-21T01:54:35.607Z",
+  "note": "Imported Git DAG into .inarch via /opt/homebrew/bin/inr"
+}
