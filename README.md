@@ -630,3 +630,35 @@ See `RUNBOOK.md` for the full operator procedure.
 | `manifest.go` | `manifest` and `verify` (byte-exact and `--from-structure` round-trip verification) |
 | `serve.go` | Authenticated HTTP service (`/ingest`, `/manifest`) |
 | `schema.sql` | Complete 11-table Spanner GoogleSQL schema (`STRING(64)` commit SHAs for `.inarch` + `.git`) |
+
+### X.509 workload identity for a shared MCP host
+
+`CODE_GRAPH_CREDENTIALS_PROFILE=workload_identity_federation` (or the
+`VELENZA_CAMBIUM_` prefix) selects an explicit certificate-sourced
+`external_account` carrier through process-local `GOOGLE_APPLICATION_CREDENTIALS`.
+Set `CREDENTIALS_SOURCE=application_default`, `CREDENTIALS_BASE_IDENTITY` to the
+host's exact device account, `CREDENTIALS_IDENTITY` to its distinct scoped graph
+operator, and `CREDENTIALS_AUDIENCE` to the exact workload identity provider URI.
+Only canonical Google mTLS STS/source-impersonation endpoints and owner-only
+explicit certificate/configuration/key files are accepted. Token files,
+executables, ambient ADC discovery, proxy/transport overrides, source identity
+substitution and fallback to another profile are refused. The already-pinned
+modern Google auth SDK performs X.509 federation; a second impersonation hop
+obtains the scoped graph identity before any graph or Vertex operation.
+
+Run `/app/code-graph mcp` through a private per-client stdio session; the existing
+`serve` command is a separate REST interface. Keep device material on its owning
+host with read-only runtime mounts. This profile does not create credentials,
+change IAM, initialize databases, or prove that a container has been deployed.
+
+### Verification and delivery
+
+Run `scripts/verify-locally.sh` on the designated verification host through
+`python3 "$VERIFY_RESOURCE_GUARD" --cwd <unique-run-checkout> -- bash scripts/verify-locally.sh`.
+Use an owned NVMe workspace and caches, preserve exact-revision output, and
+clean the run's own artifacts after collecting evidence. This replaces the
+automatic CI test workflow. Tests and coverage are never dispatched to CI;
+CI is reserved for an explicitly requested deployment. Independent acceptance
+and protected pull-request provenance remain required. Native macOS service
+manager exercise remains a separately recorded platform check; this command
+makes no claim to run a macOS daemon on Linux.

@@ -530,3 +530,19 @@ func TestLoadGoogleCredentialSelectorAcceptsExplicitCarrierFile(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadWorkloadCredentialSelectorBindsAudienceAndSourceIdentity(t *testing.T) {
+	env := map[string]string{"CODE_GRAPH_CREDENTIALS_SOURCE": "application_default", "CODE_GRAPH_CREDENTIALS_PROFILE": "workload_identity_federation", "CODE_GRAPH_CREDENTIALS_IDENTITY": "cambium-operator@example-project.iam.gserviceaccount.com", "CODE_GRAPH_CREDENTIALS_BASE_IDENTITY": "workstation-caller@example-project.iam.gserviceaccount.com", "CODE_GRAPH_CREDENTIALS_AUDIENCE": "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/verification-device/providers/device-certificate"}
+	selector, err := loadGoogleCredentialSelector(func(k string) string { return env[k] })
+	if err != nil || selector.CredentialsAudience != env["CODE_GRAPH_CREDENTIALS_AUDIENCE"] || selector.CredentialsBaseIdentity != env["CODE_GRAPH_CREDENTIALS_BASE_IDENTITY"] {
+		t.Fatalf("selector=%+v err=%v", selector, err)
+	}
+	for _, key := range []string{"CODE_GRAPH_CREDENTIALS_AUDIENCE", "CODE_GRAPH_CREDENTIALS_BASE_IDENTITY"} {
+		old := env[key]
+		delete(env, key)
+		if _, err := loadGoogleCredentialSelector(func(k string) string { return env[k] }); err == nil {
+			t.Fatalf("missing %s accepted", key)
+		}
+		env[key] = old
+	}
+}
