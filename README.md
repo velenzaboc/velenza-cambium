@@ -361,20 +361,21 @@ renamed symbol's history stays continuous.
 
 ## 7. CLI reference
 
-Every command requires exactly one validated Google credential selector:
-exactly one carrier — `CODE_GRAPH_CREDENTIALS_SOURCE=application_default` (the
-well-known gcloud ADC location) or `CODE_GRAPH_CREDENTIALS_FILE=<absolute
-path>` (an explicit impersonated-ADC document, for a machine whose single
-well-known slot belongs to another tool) — one supported profile
-(`impersonated_service_account` for local operation or
-`attached_service_account` on Google-hosted compute), and the exact
-`CODE_GRAPH_CREDENTIALS_IDENTITY` service-account email. Setting both carriers
-is refused, and `attached_service_account` refuses the file carrier entirely.
-Both carriers receive byte-identical validation; the explicit one is not a
-relaxed arm. Exportable service account keys and ambient credential-file
-overrides (`GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG`,
-`CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`) are rejected on both. See RUNBOOK §
-"Sharing a machine with another impersonating tool".
+Every command requires one identity-bound Google credential profile. The
+legacy `impersonated_service_account` profile selects either the well-known
+gcloud ADC carrier (`CODE_GRAPH_CREDENTIALS_SOURCE=application_default`) or an
+explicit typed impersonation document (`CODE_GRAPH_CREDENTIALS_FILE=<absolute
+path>`). Setting both is refused. `attached_service_account` proves the exact
+identity from Google-hosted metadata and accepts no file carrier. The existing
+`device_service_account` profile uses its declared legacy device source.
+
+For a shared MCP container, select `workload_identity_federation` with its own
+explicit certificate carrier, service identity and provider audience as
+described below. That profile accepts `GOOGLE_APPLICATION_CREDENTIALS` solely
+for its validated X.509 carrier and refuses a base identity or host-token hop.
+The legacy profiles retain their previous carrier and override restrictions;
+there is no fallback between credential profiles. See RUNBOOK § "Sharing a
+machine with another impersonating tool" for legacy local operation.
 
 | Command | Purpose |
 |---|---|
