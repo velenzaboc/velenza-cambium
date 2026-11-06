@@ -662,3 +662,7 @@ CI is reserved for an explicitly requested deployment. Independent acceptance
 and protected pull-request provenance remain required. Native macOS service
 manager exercise remains a separately recorded platform check; this command
 makes no claim to run a macOS daemon on Linux.
+
+Verification receipts are written outside the checkout so the source-hygiene
+scan does not ingest generated output. Set `VERIFY_EVIDENCE_DIR` to a new
+absolute directory outside the checkout, or use its private temporary default.
