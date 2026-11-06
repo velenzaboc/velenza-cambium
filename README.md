@@ -636,15 +636,19 @@ See `RUNBOOK.md` for the full operator procedure.
 `CODE_GRAPH_CREDENTIALS_PROFILE=workload_identity_federation` (or the
 `VELENZA_CAMBIUM_` prefix) selects an explicit certificate-sourced
 `external_account` carrier through process-local `GOOGLE_APPLICATION_CREDENTIALS`.
-Set `CREDENTIALS_SOURCE=application_default`, `CREDENTIALS_BASE_IDENTITY` to the
-host's exact device account, `CREDENTIALS_IDENTITY` to its distinct scoped graph
-operator, and `CREDENTIALS_AUDIENCE` to the exact workload identity provider URI.
+Set `CODE_GRAPH_CREDENTIALS_SOURCE=application_default`,
+`CODE_GRAPH_CREDENTIALS_IDENTITY` to this container's scoped graph operator, and
+`CODE_GRAPH_CREDENTIALS_AUDIENCE` to its exact workload identity provider URI.
+Leave `CODE_GRAPH_CREDENTIALS_BASE_IDENTITY` unset: this profile never mints a
+shared host token.
 Only canonical Google mTLS STS/source-impersonation endpoints and owner-only
 explicit certificate/configuration/key files are accepted. Token files,
 executables, ambient ADC discovery, proxy/transport overrides, source identity
 substitution and fallback to another profile are refused. The already-pinned
-modern Google auth SDK performs X.509 federation; a second impersonation hop
-obtains the scoped graph identity before any graph or Vertex operation.
+modern Google auth SDK performs X.509 federation directly into the declared
+scoped graph identity. The carrier's impersonation URL must name exactly that
+identity. Each container receives only its own service carrier and certificate
+mounts, with the provider subject granted access only to its own operator.
 
 Run `/app/code-graph mcp` through a private per-client stdio session; the existing
 `serve` command is a separate REST interface. Keep device material on its owning

@@ -1,8 +1,8 @@
 package gcpauth
 
 // This profile accepts only explicitly selected, certificate-sourced Google
-// workload federation. It never discovers ambient ADC, uses a device token for
-// application I/O, or substitutes another credential topology on failure.
+// workload federation. It never discovers ambient ADC, uses a shared host token, or substitutes another credential topology on failure.
+// The external-account carrier impersonates only the declared service identity.
 import (
 	"bytes"
 	"context"
@@ -16,15 +16,14 @@ import (
 
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
-	authimpersonate "cloud.google.com/go/auth/credentials/impersonate"
 	"golang.org/x/oauth2"
 )
 
 var workloadAudiencePattern = regexp.MustCompile(`^//iam\.googleapis\.com/projects/[1-9][0-9]*/locations/global/workloadIdentityPools/[a-z][a-z0-9-]{2,31}/providers/[a-z][a-z0-9-]{2,31}$`)
 
 func (s Selector) validateWorkloadIdentitySelector() error {
-	if s.CredentialsProfile != CredentialsProfileWorkloadIdentityFederation || s.CredentialsSource != CredentialsSourceApplicationDefault || s.CredentialsFile != "" || !serviceAccountEmailPattern.MatchString(s.CredentialsIdentity) || !serviceAccountEmailPattern.MatchString(s.CredentialsBaseIdentity) || s.CredentialsIdentity == s.CredentialsBaseIdentity || !workloadAudiencePattern.MatchString(s.CredentialsAudience) {
-		return fmt.Errorf("google_credentials: workload federation requires an exact audience, distinct source identity and scoped target")
+	if s.CredentialsProfile != CredentialsProfileWorkloadIdentityFederation || s.CredentialsSource != CredentialsSourceApplicationDefault || s.CredentialsFile != "" || !serviceAccountEmailPattern.MatchString(s.CredentialsIdentity) || s.CredentialsBaseIdentity != "" || !workloadAudiencePattern.MatchString(s.CredentialsAudience) {
+		return fmt.Errorf("google_credentials: direct workload federation requires an exact audience and scoped identity without a base identity")
 	}
 	return nil
 }
@@ -91,11 +90,11 @@ func (s Selector) ValidateWorkloadIdentityConfiguration() ([]byte, error) {
 	if err := decodeWorkloadJSON(raw, &carrier); err != nil {
 		return nil, err
 	}
-	expectedURL := "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/" + s.CredentialsBaseIdentity + ":generateAccessToken"
+	expectedURL := "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/" + s.CredentialsIdentity + ":generateAccessToken"
 	if carrier.Type != "external_account" || carrier.Audience != s.CredentialsAudience || carrier.SubjectTokenType != "urn:ietf:params:oauth:token-type:mtls" || carrier.TokenURL != "https://sts.mtls.googleapis.com/v1/token" || carrier.ImpersonationURL != expectedURL || (carrier.UniverseDomain != "" && carrier.UniverseDomain != "googleapis.com") {
-		return nil, fmt.Errorf("google_credentials: workload source identity, audience or endpoint does not match")
+		return nil, fmt.Errorf("google_credentials: workload service identity, audience or endpoint does not match")
 	}
-	if carrier.QuotaProject != "" && carrier.QuotaProject != serviceAccountProject(s.CredentialsBaseIdentity) {
+	if carrier.QuotaProject != "" && carrier.QuotaProject != serviceAccountProject(s.CredentialsIdentity) {
 		return nil, fmt.Errorf("google_credentials: workload quota project does not match")
 	}
 	certConfig := carrier.CredentialSource.Certificate.Config
@@ -138,14 +137,10 @@ func (s Selector) workloadIdentityTokenSource(ctx context.Context, scopes []stri
 	if err != nil {
 		return nil, fmt.Errorf("google_credentials: workload credential construction failed")
 	}
-	target, err := authimpersonate.NewCredentials(&authimpersonate.CredentialsOptions{TargetPrincipal: s.CredentialsIdentity, Scopes: scopes, Credentials: source, UniverseDomain: "googleapis.com"})
-	if err != nil {
-		return nil, fmt.Errorf("google_credentials: workload target construction failed")
-	}
 	if detach {
 		ctx = context.Background()
 	}
-	return &workloadOAuthTokenSource{ctx: ctx, provider: target}, nil
+	return &workloadOAuthTokenSource{ctx: ctx, provider: source}, nil
 }
 
 type workloadOAuthTokenSource struct {

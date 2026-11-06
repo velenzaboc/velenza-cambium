@@ -44,7 +44,7 @@ func newWorkloadFixture(t *testing.T) workloadFixture {
 	clearWorkloadEnvironment(t)
 	dir := t.TempDir()
 	f := workloadFixture{carrierPath: filepath.Join(dir, "verification host.json"), configPath: filepath.Join(dir, "certificate_config.json"), certPath: filepath.Join(dir, "client.pem"), keyPath: filepath.Join(dir, "client.key")}
-	f.selector = Selector{CredentialsSource: CredentialsSourceApplicationDefault, CredentialsProfile: CredentialsProfileWorkloadIdentityFederation, CredentialsBaseIdentity: "device-builder@verification-project.iam.gserviceaccount.com", CredentialsIdentity: "graph-operator@verification-project.iam.gserviceaccount.com", CredentialsAudience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/verification-device/providers/device-certificate"}
+	f.selector = Selector{CredentialsSource: CredentialsSourceApplicationDefault, CredentialsProfile: CredentialsProfileWorkloadIdentityFederation, CredentialsIdentity: "graph-operator@verification-project.iam.gserviceaccount.com", CredentialsAudience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/verification-device/providers/device-certificate"}
 	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +75,7 @@ func newWorkloadFixture(t *testing.T) workloadFixture {
 	writeWorkloadBytes(t, f.certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 	writeWorkloadBytes(t, f.keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private}))
 	f.config = map[string]any{"cert_configs": map[string]any{"workload": map[string]any{"cert_path": f.certPath, "key_path": f.keyPath}}}
-	f.carrier = map[string]any{"type": "external_account", "audience": f.selector.CredentialsAudience, "subject_token_type": "urn:ietf:params:oauth:token-type:mtls", "token_url": "https://sts.mtls.googleapis.com/v1/token", "service_account_impersonation_url": "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/" + f.selector.CredentialsBaseIdentity + ":generateAccessToken", "universe_domain": "googleapis.com", "credential_source": map[string]any{"certificate": map[string]any{"certificate_config_location": f.configPath}}}
+	f.carrier = map[string]any{"type": "external_account", "audience": f.selector.CredentialsAudience, "subject_token_type": "urn:ietf:params:oauth:token-type:mtls", "token_url": "https://sts.mtls.googleapis.com/v1/token", "service_account_impersonation_url": "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/" + f.selector.CredentialsIdentity + ":generateAccessToken", "universe_domain": "googleapis.com", "credential_source": map[string]any{"certificate": map[string]any{"certificate_config_location": f.configPath}}}
 	writeWorkloadJSON(t, f.configPath, f.config)
 	writeWorkloadJSON(t, f.carrierPath, f.carrier)
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", f.carrierPath)
@@ -101,6 +101,8 @@ func TestWorkloadProfileConstructsTypedX509AndScopedOperatorSources(t *testing.T
 	for _, target := range []string{"code-graph-operator@verification-project.iam.gserviceaccount.com", "history-reader@verification-project.iam.gserviceaccount.com"} {
 		s := f.selector
 		s.CredentialsIdentity = target
+		f.carrier["service_account_impersonation_url"] = "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/" + target + ":generateAccessToken"
+		writeWorkloadJSON(t, f.carrierPath, f.carrier)
 		if err := s.Validate("google_credentials"); err != nil {
 			t.Fatal(err)
 		}
@@ -108,8 +110,8 @@ func TestWorkloadProfileConstructsTypedX509AndScopedOperatorSources(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(raw), s.CredentialsBaseIdentity) {
-			t.Fatal("validated source lost device identity")
+		if !strings.Contains(string(raw), s.CredentialsIdentity) {
+			t.Fatal("validated source lost service identity")
 		}
 		source, err := s.TokenSource(context.Background())
 		if err != nil {
@@ -136,8 +138,10 @@ func TestWorkloadSelectorRejectsAmbiguousTopology(t *testing.T) {
 		{"wrong audience host", func(s *Selector) {
 			s.CredentialsAudience = strings.ReplaceAll(s.CredentialsAudience, "iam.googleapis.com", "attacker.invalid")
 		}},
-		{"missing base", func(s *Selector) { s.CredentialsBaseIdentity = "" }},
-		{"source equals target", func(s *Selector) { s.CredentialsIdentity = s.CredentialsBaseIdentity }},
+		{"host base specified", func(s *Selector) {
+			s.CredentialsBaseIdentity = "host-controller@verification-project.iam.gserviceaccount.com"
+		}},
+		{"target used as base", func(s *Selector) { s.CredentialsBaseIdentity = s.CredentialsIdentity }},
 		{"human source", func(s *Selector) { s.CredentialsBaseIdentity = "operator@example.com" }},
 		{"human target", func(s *Selector) { s.CredentialsIdentity = "operator@example.com" }},
 		{"explicit second file", func(s *Selector) { s.CredentialsFile = f.carrierPath }},
