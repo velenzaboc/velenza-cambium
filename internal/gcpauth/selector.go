@@ -32,6 +32,7 @@ const (
 	CredentialsProfileImpersonatedServiceAccount       = "impersonated_service_account"
 	CredentialsProfileAttachedServiceAccount           = "attached_service_account"
 	CredentialsProfileDeviceServiceAccount             = "device_service_account"
+	CredentialsProfileWorkloadIdentityFederation       = "workload_identity_federation"
 	CloudPlatformScope                                 = "https://www.googleapis.com/auth/cloud-platform"
 	maxCredentialConfigurationBytes              int64 = 1 << 20
 )
@@ -149,6 +150,7 @@ type Selector struct {
 	// per-account legacy_credentials location (never a config-supplied path)
 	// and uses solely as the caller that impersonates CredentialsIdentity.
 	CredentialsBaseIdentity string
+	CredentialsAudience     string
 }
 
 // Validate closes the selector before any Google client is constructed.
@@ -168,7 +170,12 @@ func (s Selector) Validate(label string) error {
 	if !serviceAccountEmailPattern.MatchString(s.CredentialsIdentity) {
 		return fmt.Errorf("%s: credentials_identity %q is not a canonical user-managed service-account email", label, s.CredentialsIdentity)
 	}
+	if s.CredentialsProfile != CredentialsProfileWorkloadIdentityFederation && s.CredentialsAudience != "" {
+		return fmt.Errorf("%s: credentials_audience is only valid for workload federation", label)
+	}
 	switch s.CredentialsProfile {
+	case CredentialsProfileWorkloadIdentityFederation:
+		return s.validateWorkloadIdentitySelector()
 	case CredentialsProfileImpersonatedServiceAccount:
 		return nil
 	case CredentialsProfileAttachedServiceAccount:
@@ -241,6 +248,8 @@ func (s Selector) tokenSource(ctx context.Context, detachRefresh bool, scopes ..
 		scopes = []string{CloudPlatformScope}
 	}
 	switch s.CredentialsProfile {
+	case CredentialsProfileWorkloadIdentityFederation:
+		return s.workloadIdentityTokenSource(ctx, scopes, detachRefresh)
 	case CredentialsProfileImpersonatedServiceAccount:
 		return s.impersonatedTokenSource(ctx, scopes, detachRefresh)
 	case CredentialsProfileAttachedServiceAccount:

@@ -361,20 +361,21 @@ renamed symbol's history stays continuous.
 
 ## 7. CLI reference
 
-Every command requires exactly one validated Google credential selector:
-exactly one carrier — `CODE_GRAPH_CREDENTIALS_SOURCE=application_default` (the
-well-known gcloud ADC location) or `CODE_GRAPH_CREDENTIALS_FILE=<absolute
-path>` (an explicit impersonated-ADC document, for a machine whose single
-well-known slot belongs to another tool) — one supported profile
-(`impersonated_service_account` for local operation or
-`attached_service_account` on Google-hosted compute), and the exact
-`CODE_GRAPH_CREDENTIALS_IDENTITY` service-account email. Setting both carriers
-is refused, and `attached_service_account` refuses the file carrier entirely.
-Both carriers receive byte-identical validation; the explicit one is not a
-relaxed arm. Exportable service account keys and ambient credential-file
-overrides (`GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG`,
-`CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`) are rejected on both. See RUNBOOK §
-"Sharing a machine with another impersonating tool".
+Every command requires one identity-bound Google credential profile. The
+legacy `impersonated_service_account` profile selects either the well-known
+gcloud ADC carrier (`CODE_GRAPH_CREDENTIALS_SOURCE=application_default`) or an
+explicit typed impersonation document (`CODE_GRAPH_CREDENTIALS_FILE=<absolute
+path>`). Setting both is refused. `attached_service_account` proves the exact
+identity from Google-hosted metadata and accepts no file carrier. The existing
+`device_service_account` profile uses its declared legacy device source.
+
+For a shared MCP container, select `workload_identity_federation` with its own
+explicit certificate carrier, service identity and provider audience as
+described below. That profile accepts `GOOGLE_APPLICATION_CREDENTIALS` solely
+for its validated X.509 carrier and refuses a base identity or host-token hop.
+The legacy profiles retain their previous carrier and override restrictions;
+there is no fallback between credential profiles. See RUNBOOK § "Sharing a
+machine with another impersonating tool" for legacy local operation.
 
 | Command | Purpose |
 |---|---|
@@ -630,3 +631,43 @@ See `RUNBOOK.md` for the full operator procedure.
 | `manifest.go` | `manifest` and `verify` (byte-exact and `--from-structure` round-trip verification) |
 | `serve.go` | Authenticated HTTP service (`/ingest`, `/manifest`) |
 | `schema.sql` | Complete 11-table Spanner GoogleSQL schema (`STRING(64)` commit SHAs for `.inarch` + `.git`) |
+
+### X.509 workload identity for a shared MCP host
+
+`CODE_GRAPH_CREDENTIALS_PROFILE=workload_identity_federation` (or the
+`VELENZA_CAMBIUM_` prefix) selects an explicit certificate-sourced
+`external_account` carrier through process-local `GOOGLE_APPLICATION_CREDENTIALS`.
+Set `CODE_GRAPH_CREDENTIALS_SOURCE=application_default`,
+`CODE_GRAPH_CREDENTIALS_IDENTITY` to this container's scoped graph operator, and
+`CODE_GRAPH_CREDENTIALS_AUDIENCE` to its exact workload identity provider URI.
+Leave `CODE_GRAPH_CREDENTIALS_BASE_IDENTITY` unset: this profile never mints a
+shared host token.
+Only canonical Google mTLS STS/source-impersonation endpoints and owner-only
+explicit certificate/configuration/key files are accepted. Token files,
+executables, ambient ADC discovery, proxy/transport overrides, source identity
+substitution and fallback to another profile are refused. The already-pinned
+modern Google auth SDK performs X.509 federation directly into the declared
+scoped graph identity. The carrier's impersonation URL must name exactly that
+identity. Each container receives only its own service carrier and certificate
+mounts, with the provider subject granted access only to its own operator.
+
+Run `/app/code-graph mcp` through a private per-client stdio session; the existing
+`serve` command is a separate REST interface. Keep device material on its owning
+host with read-only runtime mounts. This profile does not create credentials,
+change IAM, initialize databases, or prove that a container has been deployed.
+
+### Verification and delivery
+
+Run `scripts/verify-locally.sh` on the designated verification host through
+`python3 "$VERIFY_RESOURCE_GUARD" --cwd <unique-run-checkout> -- bash scripts/verify-locally.sh`.
+Use an owned NVMe workspace and caches, preserve exact-revision output, and
+clean the run's own artifacts after collecting evidence. This replaces the
+automatic CI test workflow. Tests and coverage are never dispatched to CI;
+CI is reserved for an explicitly requested deployment. Independent acceptance
+and protected pull-request provenance remain required. Native macOS service
+manager exercise remains a separately recorded platform check; this command
+makes no claim to run a macOS daemon on Linux.
+
+Verification receipts are written outside the checkout so the source-hygiene
+scan does not ingest generated output. Set `VERIFY_EVIDENCE_DIR` to a new
+absolute directory outside the checkout, or use its private temporary default.

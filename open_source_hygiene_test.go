@@ -303,15 +303,18 @@ func TestOpenSourceHygiene_NoHardcodedProjectIdsInSourceOrDocs(t *testing.T) {
 		t.Fatalf("CONTRIBUTING.md does not contain Open-Source Hygiene Policy header")
 	}
 
-	ciBytes, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
+	verificationBytes, err := os.ReadFile(filepath.Join("scripts", "verify-locally.sh"))
 	if err != nil {
-		t.Fatalf("read .github/workflows/ci.yml: %v", err)
+		t.Fatalf("read local verification procedure: %v", err)
 	}
-	ciText := string(ciBytes)
-	for _, requiredCI := range []string{"actions/checkout@v4", "actions/setup-go@v5", "go vet ./...", "go build ./...", "go test -race -count=1 ./..."} {
-		if !strings.Contains(ciText, requiredCI) {
-			t.Errorf(".github/workflows/ci.yml missing self-contained CI step %q", requiredCI)
+	verificationText := string(verificationBytes)
+	for _, required := range []string{"go vet ./...", "go build ./...", "go test -race -count=1", "-coverprofile="} {
+		if !strings.Contains(verificationText, required) {
+			t.Errorf("local verification procedure missing executable check %q", required)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(".github", "workflows", "ci.yml")); !os.IsNotExist(err) {
+		t.Fatal("automatic CI test workflow must remain absent")
 	}
 
 	readmeBytes, err := os.ReadFile("README.md")

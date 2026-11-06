@@ -44,6 +44,7 @@ func loadGoogleCredentialSelector(getenv func(string) string) (gcpauth.Selector,
 		CredentialsProfile:      firstEnv("VELENZA_CAMBIUM_CREDENTIALS_PROFILE", "CODE_GRAPH_CREDENTIALS_PROFILE"),
 		CredentialsIdentity:     firstEnv("VELENZA_CAMBIUM_CREDENTIALS_IDENTITY", "CODE_GRAPH_CREDENTIALS_IDENTITY"),
 		CredentialsBaseIdentity: firstEnv("VELENZA_CAMBIUM_CREDENTIALS_BASE_IDENTITY", "CODE_GRAPH_CREDENTIALS_BASE_IDENTITY"),
+		CredentialsAudience:     firstEnv("VELENZA_CAMBIUM_CREDENTIALS_AUDIENCE", "CODE_GRAPH_CREDENTIALS_AUDIENCE"),
 	}
 	if err := selector.Validate("code_graph_google_credentials"); err != nil {
 		return gcpauth.Selector{}, err
